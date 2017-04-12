@@ -17,6 +17,7 @@ import Utils.Ops exposing (..)
 import Utils.Log exposing (..)
 import Dict
 import Slate.Engine.Query exposing (..)
+import Slate.Common.Event exposing (..)
 import Slate.DbWatcher.Common.Interface exposing (..)
 
 
@@ -26,25 +27,13 @@ port exitApp : Float -> Cmd msg
 port externalStop : (() -> msg) -> Sub msg
 
 
-
--- dbConnectionInfo : DbConnectionInfo
--- dbConnectionInfo =
---     { host = "testDbWatcherServer"
---     , port_ = 5432
---     , database = "test_dbwatcher"
---     , user = "postgres"
---     , password = "password"
---     , timeout = 15000
---     }
-
-
 dbConnectionInfo : DbConnectionInfo
 dbConnectionInfo =
-    { host = "localPGDbServer"
+    { host = "testDbWatcherServer"
     , port_ = 5432
-    , database = "parallelsTest"
-    , user = "parallels"
-    , password = "parallelspw"
+    , database = "test_dbwatcher"
+    , user = "postgres"
+    , password = "password"
     , timeout = 15000
     }
 
@@ -101,12 +90,14 @@ type Msg
     | DbWatcherStarted
     | DbWatcherStop
     | SubscribeError ( QueryId, String )
+    | UnsubscribeError ( QueryId, String )
     | Stop ()
     | DbWatcherStopped
 
 
 type alias Model =
     { running : Bool
+    , countSubscribed : Int
     , dbWatcherModel : DbWatcher.Model QueryId
     }
 
@@ -121,6 +112,7 @@ initModel =
             DbWatcher.start dbWatcherConfig dbConnectionInfo dbWatcherModel1 ??= (\error -> ( dbWatcherModel1, delayUpdateMsg (DbWatcherError ( FatalError, error )) 0 ))
     in
         ( { running = False
+          , countSubscribed = 0
           , dbWatcherModel = dbWatcherModel2
           }
         , Cmd.batch [ startCmd, initCmd ]
@@ -130,11 +122,6 @@ initModel =
 init : ( Model, Cmd Msg )
 init =
     initModel
-
-
-delayUpdateMsg : Msg -> Time -> Cmd Msg
-delayUpdateMsg msg delay =
-    Task.perform (\_ -> msg) <| Process.sleep delay
 
 
 update : Msg -> Model -> ( Model, Cmd Msg )
@@ -172,16 +159,13 @@ update msg model =
                         [ ( "Person", [ ( "entity", "created", Nothing ), ( "property", "added", Just "name" ) ] ) ]
 
                     ( dbWatcherModel, cmd ) =
-                        DbWatcher.subscribe dbWatcherConfig model.dbWatcherModel entityEventTypes 1 SubscribeError
+                        DbWatcher.subscribe dbWatcherConfig model.dbWatcherModel entityEventTypes (model.countSubscribed + 1) SubscribeError
                             ??= (\errors -> ( model.dbWatcherModel, delayUpdateMsg (DbWatcherError ( FatalError, (String.join "," errors) )) 0 ))
 
                     l =
                         DebugF.log "App" "DbWatcher Started"
-
-                    ll =
-                        DebugF.log "DbWatcher Dict" (Dict.toList dbWatcherModel.watchedEntities)
                 in
-                    ({ model | running = True } ! [ cmd ])
+                    ({ model | running = True, dbWatcherModel = dbWatcherModel, countSubscribed = model.countSubscribed + 1 } ! [ cmd ])
 
             DbWatcherStop ->
                 let
@@ -195,19 +179,40 @@ update msg model =
                     l =
                         DebugF.log "App " "DbWatcher Stopped"
                 in
-                    model ! []
+                    model ! [ exitApp 0 ]
 
             DbWatcherRefresh queryIds ->
                 let
+                    ( dbWatcherModel, cmd ) =
+                        (model.countSubscribed < 8)
+                            ? ( DbWatcher.subscribe dbWatcherConfig model.dbWatcherModel (createEntityEventTypes (model.countSubscribed + 1)) (model.countSubscribed + 1) SubscribeError
+                                    ??= (\errors -> ( model.dbWatcherModel, delayUpdateMsg (DbWatcherError ( NonFatalError, (String.join "," errors) )) 0 ))
+                              , (model.countSubscribed == 8)
+                                    ? ( DbWatcher.unsubscribe dbWatcherConfig model.dbWatcherModel 4 UnsubscribeError
+                                            ??= (\errors -> ( model.dbWatcherModel, delayUpdateMsg (DbWatcherError ( NonFatalError, (String.join "," errors) )) 0 ))
+                                      , DbWatcher.stop dbWatcherConfig model.dbWatcherModel
+                                            ??= (\error -> ( model.dbWatcherModel, delayUpdateMsg (DbWatcherError ( NonFatalError, error )) 0 ))
+                                      )
+                              )
+
                     l =
-                        DebugF.log "App " ("DbWatcher Refresh" +-+ queryIds)
+                        ( DebugF.log "App " ("DbWatcher Refresh" +-+ queryIds)
+                        , DebugF.log "App DbWatcher WatchedEntities" (Dict.toList dbWatcherModel.watchedEntities)
+                        )
                 in
-                    model ! []
+                    ({ model | dbWatcherModel = dbWatcherModel, countSubscribed = model.countSubscribed + 1 }) ! [ cmd ]
 
             SubscribeError ( queryId, error ) ->
                 let
                     l =
                         DebugF.log "SubscribeError" ("queryId:" +-+ queryId +-+ "error:" +-+ error)
+                in
+                    model ! [ exitApp 0 ]
+
+            UnsubscribeError ( queryId, error ) ->
+                let
+                    l =
+                        DebugF.log "UnsubscribeError" ("queryId:" +-+ queryId +-+ "error:" +-+ error)
                 in
                     model ! [ exitApp 0 ]
 
@@ -232,3 +237,39 @@ subscriptions model =
             DbWatcher.elmSubscriptions dbWatcherConfig model.dbWatcherModel
     in
         model.running ? ( Sub.batch [ stopApp, dbWatcherSub ], stopApp )
+
+
+delayUpdateMsg : Msg -> Time -> Cmd Msg
+delayUpdateMsg msg delay =
+    Task.perform (\_ -> msg) <| Process.sleep delay
+
+
+createEntityEventTypes : Int -> List EntityEventTypes
+createEntityEventTypes queryId =
+    case queryId % 8 of
+        0 ->
+            [ ( "Person", [ ( "entity", "created", Nothing ), ( "property", "added", Just "name" ) ] ) ]
+
+        1 ->
+            [ ( "User", [ ( "entity", "created", Nothing ), ( "property", "added", Just "authenticationMethod" ) ] ) ]
+
+        2 ->
+            [ ( "Person", [ ( "relationship", "added", Just "address" ), ( "relationship", "removed", Just "address" ) ] ) ]
+
+        3 ->
+            [ ( "Person", [ ( "entity", "destroyed", Nothing ) ] ) ]
+
+        4 ->
+            [ ( "User", [ ( "entity", "created", Nothing ), ( "entity", "destroyed", Nothing ) ] ) ]
+
+        5 ->
+            [ ( "Person", [ ( "relationship", "added", Just "address" ) ] ) ]
+
+        6 ->
+            [ ( "BadEntity", [] ) ]
+
+        7 ->
+            []
+
+        _ ->
+            Debug.crash "This should never happen"
