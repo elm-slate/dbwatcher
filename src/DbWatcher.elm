@@ -118,16 +118,6 @@ init config =
     )
 
 
-delayUpdateMsg : Time -> msg -> Cmd msg
-delayUpdateMsg delay msg =
-    Task.perform (\_ -> msg) <| Process.sleep delay
-
-
-delayCmd : Cmd Msg -> Time -> Cmd Msg
-delayCmd cmd =
-    (flip delayUpdateMsg) <| DoCmd cmd
-
-
 
 {-
    API
@@ -188,53 +178,6 @@ unsubscribe config model comparable unsubscribeErrorTagger =
     destroySubscriber model comparable unsubscribeErrorTagger
 
 
-
-{-
-   Helpers
--}
-
-
-createSubscriber : Config comparable msg -> List EntityEventTypes -> Model comparable -> comparable -> SubscribeErrorTagger comparable msg -> Result (List String) ( Model comparable, Cmd msg )
-createSubscriber config entityEventTypesList model targetDbWatcherId subscribeErrorTagger =
-    let
-        initialErrors =
-            List.isEmpty entityEventTypesList ? ( [ "no entityEventTypes exist" ], [] )
-
-        validate ( entityName, eventTypes ) errors =
-            let
-                validations =
-                    [ ( config.validateId targetDbWatcherId, "dbWatcherId is not valid:" +-+ targetDbWatcherId )
-                    , ( List.isEmpty eventTypes, "no event types exist for" +-+ entityName )
-                    ]
-            in
-                List.append
-                    (validations
-                        |> List.filter (\( condition, _ ) -> condition)
-                        |> List.map (\( _, errorMessage ) -> errorMessage)
-                    )
-                    errors
-
-        errors =
-            List.foldl validate initialErrors entityEventTypesList
-    in
-        case errors of
-            [] ->
-                Ok ( { model | watchedEntities = Dict.insert targetDbWatcherId entityEventTypesList model.watchedEntities }, Cmd.none )
-
-            _ :: _ ->
-                Err errors
-
-
-destroySubscriber : Model comparable -> comparable -> UnsubscribeErrorTagger comparable msg -> Result (List String) ( Model comparable, Cmd msg )
-destroySubscriber model targetcomparable unsubscribeErrorTagger =
-    case Dict.get targetcomparable model.watchedEntities of
-        Just _ ->
-            Ok ( { model | watchedEntities = Dict.remove targetcomparable model.watchedEntities }, Cmd.none )
-
-        Nothing ->
-            Err [ "Cannot unsubscribe watcher id" +-+ targetcomparable +-+ "that does not exist" ]
-
-
 {-|
     update
 -}
@@ -247,11 +190,11 @@ update config msg model =
         nonFatal error =
             config.clientInterface.errorTagger ( NonFatalError, error )
 
+        dbConnectionInfo model =
+            model.maybeDbConnectionInfo ?!= (\_ -> Debug.crash "BUG: model.maybeDbConnectionInfo cannot be Nothing")
+
         updateRetry =
             updateChildParent (Retry.update retryConfig) (update config) .retryModel retryConfig.routeToMeTagger (\model retryModel -> { model | retryModel = retryModel })
-
-        dbConnectionInfo model =
-            model.maybeDbConnectionInfo ?!= Debug.crash "BUG: model.maybeDbConnectionInfo cannot be Nothing"
     in
         case msg of
             Nop ->
@@ -265,7 +208,7 @@ update config msg model =
                     newModel =
                         { model | watchedEntities = Dict.empty }
                 in
-                    ( newModel ! [], logInfo ("Service Stopped.  Model:" +-+ newModel) :: [ config.clientInterface.stoppedMsg ] )
+                    ( newModel ! [], logInfo ("DbWatcher Stopped.  Model:" +-+ newModel) :: [ config.clientInterface.stoppedMsg ] )
 
             PGConnect cause pgConnectionId ->
                 let
@@ -350,35 +293,33 @@ update config msg model =
                     listenPayloadDecodedResult =
                         JD.decodeString listenPayloadDecoder pgMessage
 
-                    ( entityName, notifications ) =
-                        case model.running of
-                            True ->
-                                Result.map
-                                    (\payload ->
-                                        ( payload.event.entityName
-                                        , createNotifications config payload.event.entityName payload.event.target payload.event.operation payload.event.propertyName model.watchedEntities
+                    ( entityName, refreshList, error ) =
+                        model.running
+                            ? ( listenPayloadDecodedResult
+                                    |??>
+                                        (\payload ->
+                                            ( payload.event.entityName
+                                            , createRefreshList config payload.event.entityName payload.event.target payload.event.operation payload.event.propertyName model.watchedEntities
+                                            , ""
+                                            )
                                         )
-                                    )
-                                    listenPayloadDecodedResult
-                                    ??= (\err -> ( "Listen payload event.entityName not found:" +-+ err, [] ))
-
-                            False ->
-                                Result.map
-                                    (\payload -> ( "DbWatcher not running, listen event" +-+ payload.event.entityName +-+ "not processed", [] ))
-                                    listenPayloadDecodedResult
-                                    ??= (\err -> ( "DbWatcher not running, listen event not processed.  Listen payload event.entityName not found:" +-+ err, [] ))
+                                    ??= (\err -> ( "", [], "Listen payload event.entityName not found:" +-+ err ))
+                              , listenPayloadDecodedResult
+                                    |??>
+                                        (\payload ->
+                                            ( "", [], "DbWatcher not running, listen event" +-+ payload.event.entityName +-+ "not processed" )
+                                        )
+                                    ??= (\err ->
+                                            ( "", [], "DbWatcher not running, listen event not processed.  Listen payload event.entityName not found:" +-+ err )
+                                        )
+                              )
 
                     msgs =
-                        let
-                            defaultMsgs =
-                                [ logInfo <| "PG Event Received:" +-+ entityName +-+ "Notifications:" +-+ notifications ]
-                        in
-                            case notifications of
-                                [] ->
-                                    defaultMsgs
-
-                                _ :: _ ->
-                                    config.clientInterface.refreshTagger notifications :: defaultMsgs
+                        (String.length error > 0)
+                            ? ( [ nonFatal error ]
+                              , (List.length refreshList > 0)
+                                    ? ( [ config.clientInterface.refreshTagger refreshList ], [] )
+                              )
                 in
                     ( model ! [], msgs )
 
@@ -412,27 +353,76 @@ elmSubscriptions config model =
         model.running ? ( Sub.map config.clientInterface.routeToMeTagger pgSub, Sub.none )
 
 
-createNotifications : Config comparable msg -> EntityName -> Target -> Operation -> Maybe PropertyName -> WatchedEntitiesDict comparable -> List comparable
-createNotifications config compareEntityName compareTarget compareOperation comparePropertyName watchedEntities =
+
+{-
+   Helpers
+-}
+
+
+createSubscriber : Config comparable msg -> List EntityEventTypes -> Model comparable -> comparable -> SubscribeErrorTagger comparable msg -> Result (List String) ( Model comparable, Cmd msg )
+createSubscriber config entityEventTypesList model targetDbWatcherId subscribeErrorTagger =
+    let
+        initialErrors =
+            List.isEmpty entityEventTypesList ? ( [ "no entityEventTypes exist" ], [] )
+
+        validate ( entityName, eventTypes ) errors =
+            let
+                validations =
+                    [ ( config.validateId targetDbWatcherId, "dbWatcherId is not valid:" +-+ targetDbWatcherId )
+                    , ( List.isEmpty eventTypes, "no event types exist for" +-+ entityName )
+                    ]
+            in
+                List.append
+                    (validations
+                        |> List.filter (\( condition, _ ) -> condition)
+                        |> List.map (\( _, errorMessage ) -> errorMessage)
+                    )
+                    errors
+
+        errors =
+            List.foldl validate initialErrors entityEventTypesList
+    in
+        case errors of
+            [] ->
+                Ok ( { model | watchedEntities = Dict.insert targetDbWatcherId entityEventTypesList model.watchedEntities }, Cmd.none )
+
+            _ :: _ ->
+                Err errors
+
+
+destroySubscriber : Model comparable -> comparable -> UnsubscribeErrorTagger comparable msg -> Result (List String) ( Model comparable, Cmd msg )
+destroySubscriber model targetcomparable unsubscribeErrorTagger =
+    case Dict.get targetcomparable model.watchedEntities of
+        Just _ ->
+            Ok ( { model | watchedEntities = Dict.remove targetcomparable model.watchedEntities }, Cmd.none )
+
+        Nothing ->
+            Err [ "Cannot unsubscribe watcher id" +-+ targetcomparable +-+ "that does not exist" ]
+
+
+createRefreshList : Config comparable msg -> EntityName -> Target -> Operation -> Maybe PropertyName -> WatchedEntitiesDict comparable -> List comparable
+createRefreshList config compareEntityName compareTarget compareOperation comparePropertyName watchedEntities =
     let
         compareEventType =
             ( compareTarget, compareOperation, comparePropertyName )
 
-        eventTypeMatches eventTypes =
+        selectEventTypes eventTypes =
             List.length (List.filter (\eventType -> eventType == compareEventType) eventTypes) > 0
 
-        -- selectMatches ( entityName, eventTypes ) =
-        selectMatches entityEventTypesList =
-            let
-                matches =
-                    List.filter (\( entityName, eventTypes ) -> (entityName == compareEntityName) ? ( (eventTypeMatches eventTypes), False )) entityEventTypesList
-            in
-                (List.length matches > 0) ? ( True, False )
+        selectWatchedEntities entityEventTypesList =
+            List.length
+                (List.filter
+                    (\( entityName, eventTypes ) ->
+                        (entityName == compareEntityName) ? ( (selectEventTypes eventTypes), False )
+                    )
+                    entityEventTypesList
+                )
+                > 0
 
         l =
-            Debug.log "event received from DB" ( compareEntityName, compareTarget, compareOperation, comparePropertyName )
+            Debug.log "In createRefreshList: event received from DB" ( compareEntityName, compareTarget, compareOperation, comparePropertyName )
     in
-        Dict.filter (\_ entityEventTypesList -> selectMatches entityEventTypesList) watchedEntities
+        Dict.filter (\_ entityEventTypesList -> selectWatchedEntities entityEventTypesList) watchedEntities
             |> Dict.keys
 
 
@@ -459,6 +449,16 @@ connectCmd dbConnectionInfo cause failureTagger =
         dbConnectionInfo.database
         dbConnectionInfo.user
         dbConnectionInfo.password
+
+
+delayUpdateMsg : Time -> msg -> Cmd msg
+delayUpdateMsg delay msg =
+    Task.perform (\_ -> msg) <| Process.sleep delay
+
+
+delayCmd : Cmd Msg -> Time -> Cmd Msg
+delayCmd cmd =
+    (flip delayUpdateMsg) <| DoCmd cmd
 
 
 listenPayloadDecoder : JD.Decoder ListenPayload
