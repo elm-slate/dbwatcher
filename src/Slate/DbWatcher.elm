@@ -3,6 +3,7 @@ module Slate.DbWatcher
         ( Msg
         , Model
         , Config
+        , interface
         , init
         , start
         , stop
@@ -14,7 +15,7 @@ module Slate.DbWatcher
 
 {-| Slate Database Watcher.
 
-@docs Msg , Model , Config , init , start , stop , subscribe , unsubscribe , update , elmSubscriptions
+@docs Msg , Model , Config , interface, init , start , stop , subscribe , unsubscribe , update , elmSubscriptions
 -}
 
 import Dict exposing (Dict)
@@ -66,6 +67,20 @@ type DisconnectCause
 channelName : String
 channelName =
     "eventsinsert"
+
+
+{-| Interface to the DbWatcher
+-}
+interface : Interface (Config comparable msg) (Model comparable) comparable Msg msg
+interface =
+    { init = init
+    , update = update
+    , start = start
+    , stop = stop
+    , subscribe = subscribe
+    , unsubscribe = unsubscribe
+    , elmSubscriptions = elmSubscriptions
+    }
 
 
 {-| Config
@@ -187,16 +202,16 @@ stop config model =
 
 {-| subscribe to DbWatcher
 -}
-subscribe : Config comparable msg -> Model comparable -> List EntityEventTypes -> comparable -> SubscribeErrorTagger comparable msg -> Result (List String) ( Model comparable, Cmd msg )
-subscribe config model entityEventTypesList comparable subscribeErrorTagger =
-    createSubscriber config entityEventTypesList model comparable subscribeErrorTagger
+subscribe : Config comparable msg -> Model comparable -> List EntityEventTypes -> comparable -> Result (List String) ( Model comparable, Cmd msg )
+subscribe config model entityEventTypesList comparable =
+    createSubscriber config entityEventTypesList model comparable
 
 
 {-| unsubscribe to DbWatcher
 -}
-unsubscribe : Config comparable msg -> Model comparable -> comparable -> UnsubscribeErrorTagger comparable msg -> Result (List String) ( Model comparable, Cmd msg )
-unsubscribe config model comparable unsubscribeErrorTagger =
-    destroySubscriber model comparable unsubscribeErrorTagger
+unsubscribe : Config comparable msg -> Model comparable -> comparable -> Result (List String) ( Model comparable, Cmd msg )
+unsubscribe config model comparable =
+    destroySubscriber model comparable
 
 
 {-| update
@@ -379,8 +394,8 @@ elmSubscriptions config model =
 -}
 
 
-createSubscriber : Config comparable msg -> List EntityEventTypes -> Model comparable -> comparable -> SubscribeErrorTagger comparable msg -> Result (List String) ( Model comparable, Cmd msg )
-createSubscriber config entityEventTypesList model targetDbWatcherId subscribeErrorTagger =
+createSubscriber : Config comparable msg -> List EntityEventTypes -> Model comparable -> comparable -> Result (List String) ( Model comparable, Cmd msg )
+createSubscriber config entityEventTypesList model targetDbWatcherId =
     let
         initialErrors =
             List.isEmpty entityEventTypesList ? ( [ "no entityEventTypes exist" ], [] )
@@ -410,8 +425,8 @@ createSubscriber config entityEventTypesList model targetDbWatcherId subscribeEr
                 Err errors
 
 
-destroySubscriber : Model comparable -> comparable -> UnsubscribeErrorTagger comparable msg -> Result (List String) ( Model comparable, Cmd msg )
-destroySubscriber model targetcomparable unsubscribeErrorTagger =
+destroySubscriber : Model comparable -> comparable -> Result (List String) ( Model comparable, Cmd msg )
+destroySubscriber model targetcomparable =
     case Dict.get targetcomparable model.watchedEntities of
         Just _ ->
             Ok ( { model | watchedEntities = Dict.remove targetcomparable model.watchedEntities }, Cmd.none )

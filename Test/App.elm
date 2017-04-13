@@ -88,8 +88,6 @@ type Msg
     | DbWatcherRefresh (List QueryId)
     | DbWatcherStarted
     | DbWatcherStop
-    | SubscribeError ( QueryId, String )
-    | UnsubscribeError ( QueryId, String )
     | Stop ()
     | DbWatcherStopped
 
@@ -158,7 +156,7 @@ update msg model =
                         [ ( "Person", [ ( "entity", "created", Nothing ), ( "property", "added", Just "name" ) ] ) ]
 
                     ( dbWatcherModel, cmd ) =
-                        DbWatcher.subscribe dbWatcherConfig model.dbWatcherModel entityEventTypes (model.countSubscribed + 1) SubscribeError
+                        DbWatcher.subscribe dbWatcherConfig model.dbWatcherModel entityEventTypes (model.countSubscribed + 1)
                             ??= (\errors -> ( model.dbWatcherModel, delayUpdateMsg (DbWatcherError ( FatalError, (String.join "," errors) )) 0 ))
 
                     l =
@@ -184,10 +182,10 @@ update msg model =
                 let
                     ( dbWatcherModel, cmd ) =
                         (model.countSubscribed < 8)
-                            ? ( DbWatcher.subscribe dbWatcherConfig model.dbWatcherModel (createEntityEventTypes (model.countSubscribed + 1)) (model.countSubscribed + 1) SubscribeError
+                            ? ( DbWatcher.subscribe dbWatcherConfig model.dbWatcherModel (createEntityEventTypes (model.countSubscribed + 1)) (model.countSubscribed + 1)
                                     ??= (\errors -> ( model.dbWatcherModel, delayUpdateMsg (DbWatcherError ( NonFatalError, (String.join "," errors) )) 0 ))
                               , (model.countSubscribed == 8)
-                                    ? ( DbWatcher.unsubscribe dbWatcherConfig model.dbWatcherModel 4 UnsubscribeError
+                                    ? ( DbWatcher.unsubscribe dbWatcherConfig model.dbWatcherModel 4
                                             ??= (\errors -> ( model.dbWatcherModel, delayUpdateMsg (DbWatcherError ( NonFatalError, (String.join "," errors) )) 0 ))
                                       , DbWatcher.stop dbWatcherConfig model.dbWatcherModel
                                             ??= (\error -> ( model.dbWatcherModel, delayUpdateMsg (DbWatcherError ( NonFatalError, error )) 0 ))
@@ -200,20 +198,6 @@ update msg model =
                         )
                 in
                     ({ model | dbWatcherModel = dbWatcherModel, countSubscribed = model.countSubscribed + 1 }) ! [ cmd ]
-
-            SubscribeError ( queryId, error ) ->
-                let
-                    l =
-                        DebugF.log "SubscribeError" ("queryId:" +-+ queryId +-+ "error:" +-+ error)
-                in
-                    model ! [ exitApp 0 ]
-
-            UnsubscribeError ( queryId, error ) ->
-                let
-                    l =
-                        DebugF.log "UnsubscribeError" ("queryId:" +-+ queryId +-+ "error:" +-+ error)
-                in
-                    model ! [ exitApp 0 ]
 
             Stop _ ->
                 let
