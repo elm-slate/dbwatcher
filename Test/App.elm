@@ -3,11 +3,10 @@ port module Test.App exposing (..)
 {- TODO remove this when compiler is fixed -}
 
 import Json.Decode
-import DbWatcher exposing (..)
+import Slate.DbWatcher as DbWatcher exposing (..)
 import Time exposing (..)
 import Task exposing (..)
 import Process exposing (..)
-import DbWatcher exposing (..)
 import ParentChildUpdate exposing (..)
 import DebugF
 import StringUtils exposing ((+-+))

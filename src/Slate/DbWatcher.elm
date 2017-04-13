@@ -1,4 +1,4 @@
-module DbWatcher
+module Slate.DbWatcher
     exposing
         ( Msg
         , Model
@@ -11,6 +11,11 @@ module DbWatcher
         , update
         , elmSubscriptions
         )
+
+{-| Slate Database Watcher.
+
+@docs Msg , Model , Config , init , start , stop , subscribe , unsubscribe , update , elmSubscriptions
+-}
 
 import Dict exposing (Dict)
 import Time exposing (Time)
@@ -63,6 +68,8 @@ channelName =
     "eventsinsert"
 
 
+{-| Config
+-}
 type alias Config comparable msg =
     { pgReconnectDelayInterval : Time
     , stopDelayInterval : Time
@@ -79,6 +86,8 @@ retryConfig =
     }
 
 
+{-| Msg
+-}
 type Msg
     = Nop
     | Stopped
@@ -95,6 +104,8 @@ type Msg
     | RetryModule (Retry.Msg Msg)
 
 
+{-| Model
+-}
 type alias Model comparable =
     { watchedEntities : WatchedEntitiesDict comparable
     , maybeDbConnectionInfo : Maybe DbConnectionInfo
@@ -105,6 +116,8 @@ type alias Model comparable =
     }
 
 
+{-| init DbWatcher
+-}
 init : Config comparable msg -> ( Model comparable, Cmd msg )
 init config =
     ({ watchedEntities = Dict.empty
@@ -124,6 +137,8 @@ init config =
 -}
 
 
+{-| start DbWatcher
+-}
 start : Config comparable msg -> DbConnectionInfo -> Model comparable -> Result String ( Model comparable, Cmd msg )
 start config dbConnectionInfo model =
     model.running
@@ -138,6 +153,8 @@ start config dbConnectionInfo model =
           )
 
 
+{-| stop DbWatcher
+-}
 stop : Config comparable msg -> Model comparable -> Result String ( Model comparable, Cmd msg )
 stop config model =
     let
@@ -168,18 +185,21 @@ stop config model =
         Ok ({ model | running = False, pgListenConnectionId = Nothing, pgListenError = False, maybeDbConnectionInfo = Nothing } ! [ cmd ])
 
 
+{-| subscribe to DbWatcher
+-}
 subscribe : Config comparable msg -> Model comparable -> List EntityEventTypes -> comparable -> SubscribeErrorTagger comparable msg -> Result (List String) ( Model comparable, Cmd msg )
 subscribe config model entityEventTypesList comparable subscribeErrorTagger =
     createSubscriber config entityEventTypesList model comparable subscribeErrorTagger
 
 
+{-| unsubscribe to DbWatcher
+-}
 unsubscribe : Config comparable msg -> Model comparable -> comparable -> UnsubscribeErrorTagger comparable msg -> Result (List String) ( Model comparable, Cmd msg )
 unsubscribe config model comparable unsubscribeErrorTagger =
     destroySubscriber model comparable unsubscribeErrorTagger
 
 
-{-|
-    update
+{-| update
 -}
 update : Config comparable msg -> Msg -> Model comparable -> ( ( Model comparable, Cmd Msg ), List msg )
 update config msg model =
