@@ -17,7 +17,6 @@ import Utils.Log exposing (..)
 import Dict
 import Slate.Engine.Query exposing (..)
 import Slate.Common.Event exposing (..)
-import Slate.DbWatcher.Common.Interface exposing (..)
 
 
 port exitApp : Float -> Cmd msg
@@ -56,19 +55,11 @@ main =
         }
 
 
-type alias Config comparable msg =
-    { pgReconnectDelayInterval : Time
-    , stopDelayInterval : Time
-    , validateId : comparable -> Bool
-    , clientInterface : ClientInterface comparable Msg msg
-    }
-
-
 dbWatcherConfig : DbWatcher.Config QueryId Msg
 dbWatcherConfig =
     { pgReconnectDelayInterval = pgReconnectDelayInterval
     , stopDelayInterval = stopDelayInterval
-    , validateId = (\queryId -> queryId < 0)
+    , invalidId = (\queryId -> queryId < 0)
     , clientInterface =
         { errorTagger = DbWatcherError
         , logTagger = DbWatcherLog

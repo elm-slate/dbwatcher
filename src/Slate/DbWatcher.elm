@@ -88,7 +88,7 @@ interface =
 type alias Config comparable msg =
     { pgReconnectDelayInterval : Time
     , stopDelayInterval : Time
-    , validateId : comparable -> Bool
+    , invalidId : comparable -> Bool
     , clientInterface : ClientInterface comparable Msg msg
     }
 
@@ -403,7 +403,7 @@ createSubscriber config entityEventTypesList model targetDbWatcherId =
         validate ( entityName, eventTypes ) errors =
             let
                 validations =
-                    [ ( config.validateId targetDbWatcherId, "dbWatcherId is not valid:" +-+ targetDbWatcherId )
+                    [ ( config.invalidId targetDbWatcherId, "dbWatcherId is not valid:" +-+ targetDbWatcherId )
                     , ( List.isEmpty eventTypes, "no event types exist for" +-+ entityName )
                     ]
             in
