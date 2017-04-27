@@ -453,9 +453,6 @@ createRefreshList config compareEntityName compareTarget compareOperation compar
                     entityEventTypesList
                 )
                 > 0
-
-        l =
-            Debug.log "In createRefreshList: event received from DB" ( compareEntityName, compareTarget, compareOperation, comparePropertyName )
     in
         Dict.filter (\_ entityEventTypesList -> selectWatchedEntities entityEventTypesList) watchedEntities
             |> Dict.keys
