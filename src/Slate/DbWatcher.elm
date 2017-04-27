@@ -197,7 +197,7 @@ stop config model =
                         )
                       )
     in
-        Ok ({ model | running = False, pgListenConnectionId = Nothing, pgListenError = False, maybeDbConnectionInfo = Nothing } ! [ cmd ])
+        Ok ({ model | running = False, watchedEntities = Dict.empty, pgListenConnectionId = Nothing, pgListenError = False } ! [ cmd ])
 
 
 {-| subscribe to DbWatcher
@@ -241,7 +241,7 @@ update config msg model =
             Stopped ->
                 let
                     newModel =
-                        { model | watchedEntities = Dict.empty }
+                        { model | watchedEntities = Dict.empty, maybeDbConnectionInfo = Nothing }
                 in
                     ( newModel ! [], logInfo ("DbWatcher Stopped.  Model:" +-+ newModel) :: [ config.clientInterface.stoppedMsg ] )
 
