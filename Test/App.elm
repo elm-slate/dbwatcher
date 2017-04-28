@@ -3,6 +3,7 @@ port module Test.App exposing (..)
 {- TODO remove this when compiler is fixed -}
 
 import Json.Decode
+import Client exposing (..)
 import Slate.DbWatcher as DbWatcher exposing (..)
 import Time exposing (..)
 import Task exposing (..)
@@ -27,13 +28,25 @@ port externalStop : (() -> msg) -> Sub msg
 
 dbConnectionInfo : DbConnectionInfo
 dbConnectionInfo =
-    { host = "testDbWatcherServer"
+    { host = "localpgdbserver"
     , port_ = 5432
-    , database = "test_dbwatcher"
-    , user = "postgres"
-    , password = "password"
+    , database = "parallelsTest"
+    , user = "parallels"
+    , password = "parallelspw"
     , timeout = 15000
     }
+
+
+
+-- dbConnectionInfo : DbConnectionInfo
+-- dbConnectionInfo =
+--     { host = "testDbWatcherServer"
+--     , port_ = 5432
+--     , database = "test_dbwatcher"
+--     , user = "postgres"
+--     , password = "password"
+--     , timeout = 15000
+--     }
 
 
 pgReconnectDelayInterval : Time
@@ -46,7 +59,22 @@ stopDelayInterval =
     5 * second
 
 
-main : Program Never Model Msg
+clientConfig =
+    { dbWatcherConfig = dbWatcherConfig
+    , interface = DbWatcher.interface
+    , routeToMeTagger = ClientModule
+    }
+
+
+dbWatcherConfig =
+    { pgReconnectDelayInterval = pgReconnectDelayInterval
+    , stopDelayInterval = stopDelayInterval
+    , invalidId = (\queryId -> queryId < 0)
+    , clientInterface = Client.clientInterface
+    }
+
+
+main : Program Never (Model) Msg
 main =
     Platform.program
         { init = init
@@ -55,55 +83,37 @@ main =
         }
 
 
-dbWatcherConfig : DbWatcher.Config QueryId Msg
-dbWatcherConfig =
-    { pgReconnectDelayInterval = pgReconnectDelayInterval
-    , stopDelayInterval = stopDelayInterval
-    , invalidId = (\queryId -> queryId < 0)
-    , clientInterface =
-        { errorTagger = DbWatcherError
-        , logTagger = DbWatcherLog
-        , routeToMeTagger = DbWatcherModule
-        , refreshTagger = DbWatcherRefresh
-        , startedMsg = DbWatcherStarted
-        , stoppedMsg = DbWatcherStopped
-        }
-    }
-
-
 type Msg
     = Nop
-    | DbWatcherError ( ErrorType, String )
-    | DbWatcherLog ( LogLevel, String )
-    | DbWatcherModule DbWatcher.Msg
-    | DbWatcherRefresh (List QueryId)
-    | DbWatcherStarted
-    | DbWatcherStop
+    | ClientError ( ErrorType, String )
+    | ClientLog ( LogLevel, String )
+    | ClientModule (Client.Msg DbWatcher.Msg)
+    | ClientRefresh (List QueryId)
+    | ClientStarted
+    | ClientStop
     | Stop ()
-    | DbWatcherStopped
+    | ClientStopped
 
 
 type alias Model =
     { running : Bool
-    , countSubscribed : Int
-    , dbWatcherModel : DbWatcher.Model QueryId
+    , clientModel : Client.Model (DbWatcher.Model QueryId)
     }
 
 
 initModel : ( Model, Cmd Msg )
 initModel =
     let
-        ( dbWatcherModel1, initCmd ) =
-            DbWatcher.init dbWatcherConfig
+        ( clientModel, cmd ) =
+            Client.init clientConfig
 
-        ( dbWatcherModel2, startCmd ) =
-            DbWatcher.start dbWatcherConfig dbConnectionInfo dbWatcherModel1 ??= (\error -> ( dbWatcherModel1, delayUpdateMsg (DbWatcherError ( FatalError, error )) 0 ))
+        ( clientModel2, cmd2 ) =
+            Client.start clientConfig dbConnectionInfo clientModel
     in
         ( { running = False
-          , countSubscribed = 0
-          , dbWatcherModel = dbWatcherModel2
+          , clientModel = clientModel
           }
-        , Cmd.batch [ startCmd, initCmd ]
+        , cmd
         )
 
 
@@ -115,90 +125,104 @@ init =
 update : Msg -> Model -> ( Model, Cmd Msg )
 update msg model =
     let
-        updatePubSub =
-            ParentChildUpdate.updateChildApp (DbWatcher.update dbWatcherConfig) update .dbWatcherModel DbWatcherModule (\model dbWatcherModel -> { model | dbWatcherModel = dbWatcherModel })
+        updateClient =
+            ParentChildUpdate.updateChildApp (Client.update clientConfig) update .clientModel ClientModule (\model clientModel -> { model | clientModel = clientModel })
     in
         case msg of
             Nop ->
                 model ! []
 
-            DbWatcherError ( errorType, details ) ->
+            ClientError ( errorType, details ) ->
                 let
                     l =
                         case errorType of
                             NonFatalError ->
-                                DebugF.log "DbWatcherError" details
+                                DebugF.log ("ClientError" +-+ errorType) details
 
                             _ ->
                                 Debug.crash <| toString details
                 in
                     model ! []
 
-            DbWatcherLog ( logLevel, details ) ->
+            ClientLog ( logLevel, details ) ->
                 let
                     l =
-                        DebugF.log "DbWatcherLog" (toString logLevel ++ ":" +-+ details)
+                        DebugF.log ("ClientLog" +-+ logLevel) details
                 in
                     model ! []
 
-            DbWatcherStarted ->
-                let
-                    entityEventTypes =
-                        [ ( "Person", [ ( "entity", "created", Nothing ), ( "property", "added", Just "name" ) ] ) ]
-
-                    ( dbWatcherModel, cmd ) =
-                        DbWatcher.subscribe dbWatcherConfig model.dbWatcherModel entityEventTypes (model.countSubscribed + 1)
-                            ??= (\errors -> ( model.dbWatcherModel, delayUpdateMsg (DbWatcherError ( FatalError, (String.join "," errors) )) 0 ))
-
-                    l =
-                        DebugF.log "App" "DbWatcher Started"
-                in
-                    ({ model | running = True, dbWatcherModel = dbWatcherModel, countSubscribed = model.countSubscribed + 1 } ! [ cmd ])
-
-            DbWatcherStop ->
+            ClientStarted ->
+                -- let
+                --     entityEventTypes =
+                --         [ ( "Person", [ ( "entity", "created", Nothing ), ( "property", "added", Just "name" ) ] ) ]
+                --
+                --     ( dbWatcherModel, cmd ) =
+                --         DbWatcher.subscribe dbWatcherConfig model.dbWatcherModel entityEventTypes (model.countSubscribed + 1)
+                --             ??= (\errors -> ( model.dbWatcherModel, delayUpdateMsg (DbWatcherError ( FatalError, (String.join "," errors) )) 0 ))
+                --
+                --     l =
+                --         DebugF.log "App" "Client Started"
+                -- in
+                --     ({ model | running = True, dbWatcherModel = dbWatcherModel, countSubscribed = model.countSubscribed + 1 } ! [ cmd ])
                 let
                     l =
-                        DebugF.log "App " "DbWatcher Stop"
+                        DebugF.log "App" "ClientStarted"
                 in
                     model ! []
 
-            DbWatcherStopped ->
+            ClientStop ->
                 let
                     l =
-                        DebugF.log "App " "DbWatcher Stopped"
+                        DebugF.log "App " "ClientStop"
+                in
+                    model ! []
+
+            ClientStopped ->
+                let
+                    l =
+                        DebugF.log "App " "ClientStopped"
                 in
                     model ! [ exitApp 0 ]
 
-            DbWatcherRefresh queryIds ->
+            ClientRefresh queryIds ->
+                -- let
+                --     ( dbWatcherModel, cmd ) =
+                --         (model.countSubscribed < 8)
+                --             ? ( interface.subscribe dbWatcherConfig model.dbWatcherModel (createEntityEventTypes (model.countSubscribed + 1)) (model.countSubscribed + 1)
+                --                     ??= (\errors -> ( model.dbWatcherModel, delayUpdateMsg (DbWatcherError ( NonFatalError, (String.join "," errors) )) 0 ))
+                --               , (model.countSubscribed == 8)
+                --                     ? ( DbWatcher.unsubscribe dbWatcherConfig model.dbWatcherModel 4
+                --                             ??= (\errors -> ( model.dbWatcherModel, delayUpdateMsg (DbWatcherError ( NonFatalError, (String.join "," errors) )) 0 ))
+                --                       , DbWatcher.stop dbWatcherConfig model.dbWatcherModel
+                --                             ??= (\error -> ( model.dbWatcherModel, delayUpdateMsg (DbWatcherError ( NonFatalError, error )) 0 ))
+                --                       )
+                --               )
+                --
+                --     l =
+                --         ( DebugF.log "App " ("DbWatcher Refresh" +-+ queryIds)
+                --         , DebugF.log "App DbWatcher WatchedEntities" (Dict.toList dbWatcherModel.watchedEntities)
+                --         )
+                -- in
+                --     ({ model | dbWatcherModel = dbWatcherModel, countSubscribed = model.countSubscribed + 1 }) ! [ cmd ]
                 let
-                    ( dbWatcherModel, cmd ) =
-                        (model.countSubscribed < 8)
-                            ? ( DbWatcher.subscribe dbWatcherConfig model.dbWatcherModel (createEntityEventTypes (model.countSubscribed + 1)) (model.countSubscribed + 1)
-                                    ??= (\errors -> ( model.dbWatcherModel, delayUpdateMsg (DbWatcherError ( NonFatalError, (String.join "," errors) )) 0 ))
-                              , (model.countSubscribed == 8)
-                                    ? ( DbWatcher.unsubscribe dbWatcherConfig model.dbWatcherModel 4
-                                            ??= (\errors -> ( model.dbWatcherModel, delayUpdateMsg (DbWatcherError ( NonFatalError, (String.join "," errors) )) 0 ))
-                                      , DbWatcher.stop dbWatcherConfig model.dbWatcherModel
-                                            ??= (\error -> ( model.dbWatcherModel, delayUpdateMsg (DbWatcherError ( NonFatalError, error )) 0 ))
-                                      )
-                              )
-
                     l =
-                        ( DebugF.log "App " ("DbWatcher Refresh" +-+ queryIds)
-                        , DebugF.log "App DbWatcher WatchedEntities" (Dict.toList dbWatcherModel.watchedEntities)
-                        )
+                        DebugF.log "App" "ClientRefresh"
                 in
-                    ({ model | dbWatcherModel = dbWatcherModel, countSubscribed = model.countSubscribed + 1 }) ! [ cmd ]
+                    model ! []
 
             Stop _ ->
                 let
                     l =
-                        DebugF.log "App " "Stop"
+                        DebugF.log "App" "Stop"
                 in
                     model ! [ exitApp 0 ]
 
-            DbWatcherModule msg ->
-                updatePubSub msg model
+            ClientModule msg ->
+                let
+                    l =
+                        DebugF.log "App" "ClientModule"
+                in
+                    updateClient msg model
 
 
 subscriptions : Model -> Sub Msg
@@ -207,10 +231,14 @@ subscriptions model =
         stopApp =
             externalStop Stop
 
-        dbWatcherSub =
-            DbWatcher.elmSubscriptions dbWatcherConfig model.dbWatcherModel
+        -- dbWatcherSub =
+        --     interface.elmSubscriptions dbWatcherConfig model.dbWatcherModel
     in
-        model.running ? ( Sub.batch [ stopApp, dbWatcherSub ], stopApp )
+        Sub.none
+
+
+
+-- model.running ? ( Sub.batch [ stopApp, dbWatcherSub ], stopApp )
 
 
 delayUpdateMsg : Msg -> Time -> Cmd Msg
