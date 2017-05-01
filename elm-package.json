@@ -4,8 +4,8 @@
     "repository": "https://github.com/elm-slate/dbwatcher.git",
     "license": "Unlicense",
     "source-directories": [
-        "src"
-        ,"Test"
+        "src",
+        "Test"
     ],
     "exposed-modules": [
         "Slate.DbWatcher"

@@ -5,7 +5,7 @@
 const elm = require('./elm.js');
 
 // get Elm ports
-const ports = elm.Test.App.worker().ports;
+const ports = elm.App.worker().ports;
 
 // keep our app alive until we get an exitCode from Elm or SIGINT or SIGTERM (see below)
 setInterval(id => id, 86400);

@@ -1,40 +1,42 @@
 module Client exposing (..)
 
+import Time exposing (..)
+import Task exposing (..)
+import Process exposing (..)
 import Utils.Log exposing (..)
 import Utils.Error exposing (..)
 import Utils.Ops exposing (..)
 import StringUtils exposing ((+-+))
 import DebugF
 import ParentChildUpdate exposing (..)
-import Slate.Engine.Query exposing (..)
 import Slate.Common.Db exposing (..)
-import Slate.Common.Event exposing (..)
 import Slate.DbWatcher.Common.Interface exposing (..)
 
 
-type alias Config config model queryId dbWatcherMsg msg =
-    { dbWatcherConfig : config
-    , interface : Interface config model queryId dbWatcherMsg msg
-    , routeToMeTagger : Msg -> msg
+type alias Config dbWatcherConfig dbWatcherModel dbWatcherId dbWatcherMsg msg =
+    { dbWatcherConfig : dbWatcherConfig
+    , interface : Interface dbWatcherConfig dbWatcherModel dbWatcherId dbWatcherMsg (Msg dbWatcherId dbWatcherMsg)
+    , routeToMeTagger : Msg dbWatcherId dbWatcherMsg -> msg
+    , startWritingMsg : msg
     }
 
 
+clientInterface : ClientInterface dbWatcherId dbWatcherMsg (Msg dbWatcherId dbWatcherMsg)
 clientInterface =
     { errorTagger = DbWatcherError
     , logTagger = DbWatcherLog
-    , routeToMeTagger = DbWatcherModule
+    , routeToMeTagger = DbWatcherMsg
     , refreshTagger = DbWatcherRefresh
     , startedMsg = DbWatcherStarted
     , stoppedMsg = DbWatcherStopped
     }
 
 
-type Msg msg
-    = Nop
-    | DbWatcherError ( ErrorType, String )
+type Msg dbWatcherId dbWatcherMsg
+    = DbWatcherError ( ErrorType, String )
     | DbWatcherLog ( LogLevel, String )
-    | DbWatcherModule msg
-    | DbWatcherRefresh (List QueryId)
+    | DbWatcherMsg dbWatcherMsg
+    | DbWatcherRefresh (List dbWatcherId)
     | DbWatcherStarted
     | DbWatcherStopped
 
@@ -42,42 +44,31 @@ type Msg msg
 type alias Model dbWatcherModel =
     { running : Bool
     , dbWatcherModel : dbWatcherModel
+    , countSubscribed : Int
     }
 
 
-init config =
-    let
-        ( dbWatcherModel, cmd ) =
-            config.interface.init config.dbWatcherConfig
-    in
-        ({ running = False
-         , dbWatcherModel = dbWatcherModel
-         }
-            ! [ Cmd.map config.routeToMeTagger cmd ]
-        )
+init : Config dbWatcherConfig dbWatcherModel dbWatcherId dbWatcherMsg msg -> DbConnectionInfo -> ( Model dbWatcherModel, Cmd msg )
+init config dbConnectionInfo =
+    config.interface.init config.dbWatcherConfig
+        |> (\( dbWatcherModel, initCmd ) ->
+                let
+                    model =
+                        { running = False, dbWatcherModel = dbWatcherModel, countSubscribed = 0 }
+                in
+                    config.interface.start config.dbWatcherConfig dbConnectionInfo model.dbWatcherModel
+                        |??> (\( dbWatcherModel, startCmd ) -> ( { model | dbWatcherModel = dbWatcherModel }, Cmd.map config.routeToMeTagger <| Cmd.batch [ startCmd, initCmd ] ))
+                        ??= (\error -> ( { model | dbWatcherModel = dbWatcherModel }, Cmd.map config.routeToMeTagger initCmd ))
+           )
 
 
-start config dbConnectionInfo model =
-    config.interface.start config.dbWatcherConfig dbConnectionInfo model.dbWatcherModel
-
-
-subscribe config model entityEventTypesList queryId =
-    config.interface.subscribe config.dbWatcherConfig model.dbWatcherModel entityEventTypesList queryId
-
-
-unsubscribe config model queryId =
-    config.interface.subscribe config.dbWatcherConfig model.dbWatcherModel queryId
-
-
+update : Config dbWatcherConfig dbWatcherModel dbWatcherId dbWatcherMsg msg -> Msg dbWatcherId dbWatcherMsg -> Model dbWatcherModel -> ( ( Model dbWatcherModel, Cmd (Msg dbWatcherId dbWatcherMsg) ), List msg )
 update config msg model =
     let
         updateDbWatcher =
-            updateChildParent (config.interface.update config.dbWatcherConfig) (update config) .dbWatcherModel DbWatcherModule (\model dbWatcherModel -> { model | dbWatcherModel = dbWatcherModel })
+            updateChildParent (config.interface.update config.dbWatcherConfig) (update config) .dbWatcherModel DbWatcherMsg (\model dbWatcherModel -> { model | dbWatcherModel = dbWatcherModel })
     in
         case msg of
-            Nop ->
-                ( model ! [], [] )
-
             DbWatcherError ( errorType, details ) ->
                 let
                     l =
@@ -110,12 +101,23 @@ update config msg model =
                 --         DebugF.log "App" "DbWatcher Started"
                 -- in
                 --     ({ model | running = True, dbWatcherModel = dbWatcherModel, countSubscribed = model.countSubscribed + 1 } ! [ cmd ])
-                ( model ! [], [] )
+                let
+                    entityEventTypes =
+                        [ ( "Person", [ ( "entity", "created", Nothing ), ( "property", "added", Just "name" ) ] ) ]
+
+                    l =
+                        DebugF.log "Client" "DbWatcherStarted"
+                in
+                    -- TODO need to fix dbWatcherId value in subscribe
+                    -- config.interface.subscribe config.dbWatcherConfig model.dbWatcherModel entityEventTypes (model.countSubscribed + 1)
+                    --     ??= (\errors -> ( model.dbWatcherModel, delayUpdateMsg (DbWatcherError ( FatalError, (String.join "," errors) )) 0 ))
+                    --     |> (\( dbWatcherModel, cmd ) -> ( { model | running = True, dbWatcherModel = dbWatcherModel, countSubscribed = model.countSubscribed + 1 } ! [], [] ))
+                    ( model ! [], [] )
 
             DbWatcherStopped ->
                 let
                     l =
-                        DebugF.log "App " "DbWatcher Stopped"
+                        DebugF.log "Client " "DbWatcherStopped"
                 in
                     ( model ! [], [] )
 
@@ -142,5 +144,23 @@ update config msg model =
                 --     ({ model | dbWatcherModel = dbWatcherModel, countSubscribed = model.countSubscribed + 1 }) ! [ cmd ]
                 ( model ! [], [] )
 
-            DbWatcherModule msg ->
-                updateDbWatcher msg model
+            DbWatcherMsg msg ->
+                let
+                    l =
+                        DebugF.log "Client " ("DbWatcherMsg" +-+ msg)
+                in
+                    updateDbWatcher msg model
+
+
+subscriptions : Model dbWatcherModel -> Sub Msg
+subscriptions model =
+    -- let
+    --     -- dbWatcherSub =
+    --     --     interface.elmSubscriptions dbWatcherConfig model.dbWatcherModel
+    -- in
+    Sub.none
+
+
+delayUpdateMsg : Msg dbWatcherId dbWatcherIdMsg -> Time -> Cmd (Msg dbWatcherId dbWatcherIdMsg)
+delayUpdateMsg msg delay =
+    Task.perform (\_ -> msg) <| Process.sleep delay

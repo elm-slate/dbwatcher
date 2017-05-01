@@ -1,4 +1,4 @@
-port module Test.App exposing (..)
+port module App exposing (..)
 
 {- TODO remove this when compiler is fixed -}
 
@@ -13,9 +13,11 @@ import DebugF
 import StringUtils exposing ((+-+))
 import Slate.Common.Db exposing (..)
 import Utils.Error exposing (..)
-import Utils.Ops exposing (..)
 import Utils.Log exposing (..)
-import Dict
+
+
+-- import Dict
+
 import Slate.Engine.Query exposing (..)
 import Slate.Common.Event exposing (..)
 
@@ -28,25 +30,13 @@ port externalStop : (() -> msg) -> Sub msg
 
 dbConnectionInfo : DbConnectionInfo
 dbConnectionInfo =
-    { host = "localpgdbserver"
+    { host = "testDbWatcherServer"
     , port_ = 5432
-    , database = "parallelsTest"
-    , user = "parallels"
-    , password = "parallelspw"
+    , database = "test_dbwatcher"
+    , user = "postgres"
+    , password = "password"
     , timeout = 15000
     }
-
-
-
--- dbConnectionInfo : DbConnectionInfo
--- dbConnectionInfo =
---     { host = "testDbWatcherServer"
---     , port_ = 5432
---     , database = "test_dbwatcher"
---     , user = "postgres"
---     , password = "password"
---     , timeout = 15000
---     }
 
 
 pgReconnectDelayInterval : Time
@@ -59,13 +49,16 @@ stopDelayInterval =
     5 * second
 
 
+clientConfig : Client.Config (DbWatcher.Config QueryId (Client.Msg QueryId DbWatcher.Msg)) (DbWatcher.Model QueryId) QueryId DbWatcher.Msg Msg
 clientConfig =
     { dbWatcherConfig = dbWatcherConfig
     , interface = DbWatcher.interface
-    , routeToMeTagger = ClientModule
+    , routeToMeTagger = ClientMsg
+    , startWritingMsg = StartWriting
     }
 
 
+dbWatcherConfig : DbWatcher.Config QueryId (Client.Msg QueryId DbWatcher.Msg)
 dbWatcherConfig =
     { pgReconnectDelayInterval = pgReconnectDelayInterval
     , stopDelayInterval = stopDelayInterval
@@ -84,15 +77,15 @@ main =
 
 
 type Msg
-    = Nop
-    | ClientError ( ErrorType, String )
+    = ClientError ( ErrorType, String )
     | ClientLog ( LogLevel, String )
-    | ClientModule (Client.Msg DbWatcher.Msg)
+    | ClientMsg (Client.Msg QueryId DbWatcher.Msg)
     | ClientRefresh (List QueryId)
     | ClientStarted
     | ClientStop
     | Stop ()
     | ClientStopped
+    | StartWriting
 
 
 type alias Model =
@@ -105,10 +98,7 @@ initModel : ( Model, Cmd Msg )
 initModel =
     let
         ( clientModel, cmd ) =
-            Client.init clientConfig
-
-        ( clientModel2, cmd2 ) =
-            Client.start clientConfig dbConnectionInfo clientModel
+            Client.init clientConfig dbConnectionInfo
     in
         ( { running = False
           , clientModel = clientModel
@@ -126,12 +116,9 @@ update : Msg -> Model -> ( Model, Cmd Msg )
 update msg model =
     let
         updateClient =
-            ParentChildUpdate.updateChildApp (Client.update clientConfig) update .clientModel ClientModule (\model clientModel -> { model | clientModel = clientModel })
+            updateChildApp (Client.update clientConfig) update .clientModel ClientMsg (\model clientModel -> { model | clientModel = clientModel })
     in
         case msg of
-            Nop ->
-                model ! []
-
             ClientError ( errorType, details ) ->
                 let
                     l =
@@ -217,12 +204,19 @@ update msg model =
                 in
                     model ! [ exitApp 0 ]
 
-            ClientModule msg ->
+            ClientMsg msg ->
                 let
                     l =
-                        DebugF.log "App" "ClientModule"
+                        DebugF.log "App" "ClientMsg"
                 in
                     updateClient msg model
+
+            StartWriting ->
+                let
+                    l =
+                        DebugF.log "App " "StartWriting"
+                in
+                    model ! []
 
 
 subscriptions : Model -> Sub Msg
@@ -234,7 +228,7 @@ subscriptions model =
         -- dbWatcherSub =
         --     interface.elmSubscriptions dbWatcherConfig model.dbWatcherModel
     in
-        Sub.none
+        stopApp
 
 
 
