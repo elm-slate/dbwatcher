@@ -10,6 +10,7 @@ import StringUtils exposing ((+-+))
 import DebugF
 import ParentChildUpdate exposing (..)
 import Slate.Common.Db exposing (..)
+import Slate.Common.Event exposing (..)
 import Slate.DbWatcher.Common.Interface exposing (..)
 
 
@@ -18,6 +19,8 @@ type alias Config dbWatcherConfig dbWatcherModel dbWatcherId dbWatcherMsg msg =
     , interface : Interface dbWatcherConfig dbWatcherModel dbWatcherId dbWatcherMsg (Msg dbWatcherId dbWatcherMsg)
     , routeToMeTagger : Msg dbWatcherId dbWatcherMsg -> msg
     , startWritingMsg : msg
+    , stopWritingMsg : msg
+    , stopMsg : msg
     }
 
 
@@ -41,20 +44,21 @@ type Msg dbWatcherId dbWatcherMsg
     | DbWatcherStopped
 
 
-type alias Model dbWatcherModel =
+type alias Model dbWatcherId dbWatcherModel =
     { running : Bool
     , dbWatcherModel : dbWatcherModel
-    , countSubscribed : Int
+    , testIds : List dbWatcherId
+    , countSubscribedOrStopped : Int
     }
 
 
-init : Config dbWatcherConfig dbWatcherModel dbWatcherId dbWatcherMsg msg -> DbConnectionInfo -> ( Model dbWatcherModel, Cmd msg )
-init config dbConnectionInfo =
+init : Config dbWatcherConfig dbWatcherModel dbWatcherId dbWatcherMsg msg -> DbConnectionInfo -> List dbWatcherId -> ( Model dbWatcherId dbWatcherModel, Cmd msg )
+init config dbConnectionInfo testIds =
     config.interface.init config.dbWatcherConfig
         |> (\( dbWatcherModel, initCmd ) ->
                 let
                     model =
-                        { running = False, dbWatcherModel = dbWatcherModel, countSubscribed = 0 }
+                        { running = False, dbWatcherModel = dbWatcherModel, testIds = testIds, countSubscribedOrStopped = 0 }
                 in
                     config.interface.start config.dbWatcherConfig dbConnectionInfo model.dbWatcherModel
                         |??> (\( dbWatcherModel, startCmd ) -> ( { model | dbWatcherModel = dbWatcherModel }, Cmd.map config.routeToMeTagger <| Cmd.batch [ startCmd, initCmd ] ))
@@ -62,7 +66,7 @@ init config dbConnectionInfo =
            )
 
 
-update : Config dbWatcherConfig dbWatcherModel dbWatcherId dbWatcherMsg msg -> Msg dbWatcherId dbWatcherMsg -> Model dbWatcherModel -> ( ( Model dbWatcherModel, Cmd (Msg dbWatcherId dbWatcherMsg) ), List msg )
+update : Config dbWatcherConfig dbWatcherModel dbWatcherId dbWatcherMsg msg -> Msg dbWatcherId dbWatcherMsg -> Model dbWatcherId dbWatcherModel -> ( ( Model dbWatcherId dbWatcherModel, Cmd (Msg dbWatcherId dbWatcherMsg) ), List msg )
 update config msg model =
     let
         updateDbWatcher =
@@ -89,78 +93,92 @@ update config msg model =
                     ( model ! [], [] )
 
             DbWatcherStarted ->
-                -- let
-                --     entityEventTypes =
-                --         [ ( "Person", [ ( "entity", "created", Nothing ), ( "property", "added", Just "name" ) ] ) ]
-                --
-                --     ( dbWatcherModel, cmd ) =
-                --         DbWatcher.subscribe dbWatcherConfig model.dbWatcherModel entityEventTypes (model.countSubscribed + 1)
-                --             ??= (\errors -> ( model.dbWatcherModel, delayUpdateMsg (DbWatcherError ( FatalError, (String.join "," errors) )) 0 ))
-                --
-                --     l =
-                --         DebugF.log "App" "DbWatcher Started"
-                -- in
-                --     ({ model | running = True, dbWatcherModel = dbWatcherModel, countSubscribed = model.countSubscribed + 1 } ! [ cmd ])
                 let
-                    entityEventTypes =
-                        [ ( "Person", [ ( "entity", "created", Nothing ), ( "property", "added", Just "name" ) ] ) ]
-
                     l =
                         DebugF.log "Client" "DbWatcherStarted"
                 in
-                    -- TODO need to fix dbWatcherId value in subscribe
-                    -- config.interface.subscribe config.dbWatcherConfig model.dbWatcherModel entityEventTypes (model.countSubscribed + 1)
-                    --     ??= (\errors -> ( model.dbWatcherModel, delayUpdateMsg (DbWatcherError ( FatalError, (String.join "," errors) )) 0 ))
-                    --     |> (\( dbWatcherModel, cmd ) -> ( { model | running = True, dbWatcherModel = dbWatcherModel, countSubscribed = model.countSubscribed + 1 } ! [], [] ))
-                    ( model ! [], [] )
+                    subscribeOrStop config model
 
             DbWatcherStopped ->
                 let
                     l =
-                        DebugF.log "Client " "DbWatcherStopped"
+                        DebugF.log "Client" "DbWatcherStopped"
                 in
-                    ( model ! [], [] )
+                    ( model ! [], [ config.stopMsg ] )
 
-            --
             DbWatcherRefresh queryIds ->
-                -- let
-                --     ( dbWatcherModel, cmd ) =
-                --         (model.countSubscribed < 8)
-                --             ? ( interface.subscribe dbWatcherConfig model.dbWatcherModel (createEntityEventTypes (model.countSubscribed + 1)) (model.countSubscribed + 1)
-                --                     ??= (\errors -> ( model.dbWatcherModel, delayUpdateMsg (DbWatcherError ( NonFatalError, (String.join "," errors) )) 0 ))
-                --               , (model.countSubscribed == 8)
-                --                     ? ( DbWatcher.unsubscribe dbWatcherConfig model.dbWatcherModel 4
-                --                             ??= (\errors -> ( model.dbWatcherModel, delayUpdateMsg (DbWatcherError ( NonFatalError, (String.join "," errors) )) 0 ))
-                --                       , DbWatcher.stop dbWatcherConfig model.dbWatcherModel
-                --                             ??= (\error -> ( model.dbWatcherModel, delayUpdateMsg (DbWatcherError ( NonFatalError, error )) 0 ))
-                --                       )
-                --               )
-                --
-                --     l =
-                --         ( DebugF.log "App " ("DbWatcher Refresh" +-+ queryIds)
-                --         , DebugF.log "App DbWatcher WatchedEntities" (Dict.toList dbWatcherModel.watchedEntities)
-                --         )
-                -- in
-                --     ({ model | dbWatcherModel = dbWatcherModel, countSubscribed = model.countSubscribed + 1 }) ! [ cmd ]
-                ( model ! [], [] )
-
-            DbWatcherMsg msg ->
                 let
                     l =
-                        DebugF.log "Client " ("DbWatcherMsg" +-+ msg)
+                        DebugF.log "Client " ("DbWatcherRefresh" +-+ queryIds)
                 in
-                    updateDbWatcher msg model
+                    subscribeOrStop config model
+
+            DbWatcherMsg msg ->
+                updateDbWatcher msg model
 
 
-subscriptions : Model dbWatcherModel -> Sub Msg
-subscriptions model =
-    -- let
-    --     -- dbWatcherSub =
-    --     --     interface.elmSubscriptions dbWatcherConfig model.dbWatcherModel
-    -- in
-    Sub.none
+subscriptions : Config dbWatcherConfig dbWatcherModel dbWatcherId dbWatcherMsg msg -> Model dbWatcherId dbWatcherModel -> Sub msg
+subscriptions config model =
+    Sub.map config.routeToMeTagger <| config.interface.elmSubscriptions config.dbWatcherConfig model.dbWatcherModel
+
+
+subscribeOrStop : Config dbWatcherConfig dbWatcherModel dbWatcherId dbWatcherMsg msg -> Model dbWatcherId dbWatcherModel -> ( ( Model dbWatcherId dbWatcherModel, Cmd (Msg dbWatcherId dbWatcherMsg) ), List msg )
+subscribeOrStop config model =
+    model.countSubscribedOrStopped
+        + 1
+        |> (\countSubscribedOrStopped ->
+                case model.testIds of
+                    [] ->
+                        ( Nothing, [], (createEntityEventTypes model.countSubscribedOrStopped), countSubscribedOrStopped )
+
+                    testId :: _ ->
+                        ( List.head model.testIds, List.drop 1 model.testIds, (createEntityEventTypes model.countSubscribedOrStopped), countSubscribedOrStopped )
+           )
+        |> (\( maybeTestId, testIds, entityEventTypes, countSubscribedOrStopped ) ->
+                maybeTestId
+                    |?> (\testId ->
+                            config.interface.subscribe config.dbWatcherConfig model.dbWatcherModel entityEventTypes testId
+                                |??> (\( dbWatcherModel, cmd ) -> ( ( { model | running = True, dbWatcherModel = dbWatcherModel, testIds = testIds, countSubscribedOrStopped = countSubscribedOrStopped }, cmd ), (model.countSubscribedOrStopped == 0) ? ( [ config.startWritingMsg ], [] ) ))
+                                ??= (\errors -> ( ( { model | testIds = testIds, countSubscribedOrStopped = countSubscribedOrStopped }, delayUpdateMsg (DbWatcherError ( NonFatalError, (String.join "," errors) )) 0 ), [] ))
+                        )
+                    ?= (config.interface.stop config.dbWatcherConfig model.dbWatcherModel
+                            |??> (\( dbWatcherModel, cmd ) -> ( ( { model | running = False, dbWatcherModel = dbWatcherModel, testIds = testIds, countSubscribedOrStopped = countSubscribedOrStopped }, cmd ), [ config.stopWritingMsg ] ))
+                            ??= (\error -> ( ( { model | running = False, countSubscribedOrStopped = countSubscribedOrStopped, testIds = testIds }, delayUpdateMsg (DbWatcherError ( NonFatalError, error )) 0 ), [] ))
+                       )
+           )
 
 
 delayUpdateMsg : Msg dbWatcherId dbWatcherIdMsg -> Time -> Cmd (Msg dbWatcherId dbWatcherIdMsg)
 delayUpdateMsg msg delay =
     Task.perform (\_ -> msg) <| Process.sleep delay
+
+
+createEntityEventTypes : Int -> List EntityEventTypes
+createEntityEventTypes count =
+    case count of
+        0 ->
+            [ ( "Person", [ ( "entity", "created", Nothing ), ( "property", "added", Just "name" ) ] ) ]
+
+        1 ->
+            [ ( "User", [ ( "entity", "created", Nothing ), ( "property", "added", Just "authenticationMethod" ) ] ) ]
+
+        2 ->
+            [ ( "Person", [ ( "relationship", "added", Just "address" ), ( "relationship", "removed", Just "address" ) ] ) ]
+
+        3 ->
+            [ ( "Person", [ ( "entity", "destroyed", Nothing ) ] ) ]
+
+        4 ->
+            [ ( "User", [ ( "entity", "created", Nothing ), ( "entity", "destroyed", Nothing ) ] ) ]
+
+        5 ->
+            [ ( "Person", [ ( "relationship", "added", Just "address" ) ] ) ]
+
+        6 ->
+            [ ( "BadEntity", [] ) ]
+
+        7 ->
+            []
+
+        _ ->
+            [ ( "Person", [ ( "entity", "created", Nothing ), ( "property", "added", Just "name" ) ] ) ]

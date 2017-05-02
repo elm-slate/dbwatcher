@@ -10,16 +10,14 @@ import Task exposing (..)
 import Process exposing (..)
 import ParentChildUpdate exposing (..)
 import DebugF
+import Retry exposing (..)
+import Postgres exposing (..)
 import StringUtils exposing ((+-+))
 import Slate.Common.Db exposing (..)
 import Utils.Error exposing (..)
 import Utils.Log exposing (..)
-
-
--- import Dict
-
+import Utils.Ops exposing (..)
 import Slate.Engine.Query exposing (..)
-import Slate.Common.Event exposing (..)
 
 
 port exitApp : Float -> Cmd msg
@@ -55,6 +53,8 @@ clientConfig =
     , interface = DbWatcher.interface
     , routeToMeTagger = ClientMsg
     , startWritingMsg = StartWriting
+    , stopWritingMsg = StopWriting
+    , stopMsg = ClientStopped
     }
 
 
@@ -64,6 +64,14 @@ dbWatcherConfig =
     , stopDelayInterval = stopDelayInterval
     , invalidId = (\queryId -> queryId < 0)
     , clientInterface = Client.clientInterface
+    }
+
+
+retryConfig : Retry.Config Msg
+retryConfig =
+    { retryMax = 3
+    , delayNext = Retry.constantDelay 5000
+    , routeToMeTagger = RetryMsg
     }
 
 
@@ -80,17 +88,28 @@ type Msg
     = ClientError ( ErrorType, String )
     | ClientLog ( LogLevel, String )
     | ClientMsg (Client.Msg QueryId DbWatcher.Msg)
-    | ClientRefresh (List QueryId)
-    | ClientStarted
     | ClientStop
     | Stop ()
     | ClientStopped
     | StartWriting
+    | StopWriting
+    | WriteEvent Int Time
+    | WriteEventSuccess ( Int, List String )
+    | WriteEventError ( Int, String )
+    | PGConnect Int
+    | PGConnectError ( Int, String )
+    | PGConnectionLost ( Int, String )
+    | PGDisconnect Int
+    | PGDisconnectError ( Int, String )
+    | RetryConnectCmd Int Msg (Cmd Msg)
+    | RetryMsg (Retry.Msg Msg)
 
 
 type alias Model =
     { running : Bool
-    , clientModel : Client.Model (DbWatcher.Model QueryId)
+    , clientModel : Client.Model QueryId (DbWatcher.Model QueryId)
+    , retryModel : Retry.Model Msg
+    , maybeConnectionId : Maybe Int
     }
 
 
@@ -98,10 +117,12 @@ initModel : ( Model, Cmd Msg )
 initModel =
     let
         ( clientModel, cmd ) =
-            Client.init clientConfig dbConnectionInfo
+            Client.init clientConfig dbConnectionInfo [ 1, 2, 3, 4, 5, 6, 7, 8 ]
     in
         ( { running = False
           , clientModel = clientModel
+          , retryModel = Retry.initModel
+          , maybeConnectionId = Nothing
           }
         , cmd
         )
@@ -117,6 +138,9 @@ update msg model =
     let
         updateClient =
             updateChildApp (Client.update clientConfig) update .clientModel ClientMsg (\model clientModel -> { model | clientModel = clientModel })
+
+        updateRetry =
+            updateChildApp (Retry.update retryConfig) update .retryModel RetryMsg (\model retryModel -> { model | retryModel = retryModel })
     in
         case msg of
             ClientError ( errorType, details ) ->
@@ -138,25 +162,6 @@ update msg model =
                 in
                     model ! []
 
-            ClientStarted ->
-                -- let
-                --     entityEventTypes =
-                --         [ ( "Person", [ ( "entity", "created", Nothing ), ( "property", "added", Just "name" ) ] ) ]
-                --
-                --     ( dbWatcherModel, cmd ) =
-                --         DbWatcher.subscribe dbWatcherConfig model.dbWatcherModel entityEventTypes (model.countSubscribed + 1)
-                --             ??= (\errors -> ( model.dbWatcherModel, delayUpdateMsg (DbWatcherError ( FatalError, (String.join "," errors) )) 0 ))
-                --
-                --     l =
-                --         DebugF.log "App" "Client Started"
-                -- in
-                --     ({ model | running = True, dbWatcherModel = dbWatcherModel, countSubscribed = model.countSubscribed + 1 } ! [ cmd ])
-                let
-                    l =
-                        DebugF.log "App" "ClientStarted"
-                in
-                    model ! []
-
             ClientStop ->
                 let
                     l =
@@ -171,32 +176,6 @@ update msg model =
                 in
                     model ! [ exitApp 0 ]
 
-            ClientRefresh queryIds ->
-                -- let
-                --     ( dbWatcherModel, cmd ) =
-                --         (model.countSubscribed < 8)
-                --             ? ( interface.subscribe dbWatcherConfig model.dbWatcherModel (createEntityEventTypes (model.countSubscribed + 1)) (model.countSubscribed + 1)
-                --                     ??= (\errors -> ( model.dbWatcherModel, delayUpdateMsg (DbWatcherError ( NonFatalError, (String.join "," errors) )) 0 ))
-                --               , (model.countSubscribed == 8)
-                --                     ? ( DbWatcher.unsubscribe dbWatcherConfig model.dbWatcherModel 4
-                --                             ??= (\errors -> ( model.dbWatcherModel, delayUpdateMsg (DbWatcherError ( NonFatalError, (String.join "," errors) )) 0 ))
-                --                       , DbWatcher.stop dbWatcherConfig model.dbWatcherModel
-                --                             ??= (\error -> ( model.dbWatcherModel, delayUpdateMsg (DbWatcherError ( NonFatalError, error )) 0 ))
-                --                       )
-                --               )
-                --
-                --     l =
-                --         ( DebugF.log "App " ("DbWatcher Refresh" +-+ queryIds)
-                --         , DebugF.log "App DbWatcher WatchedEntities" (Dict.toList dbWatcherModel.watchedEntities)
-                --         )
-                -- in
-                --     ({ model | dbWatcherModel = dbWatcherModel, countSubscribed = model.countSubscribed + 1 }) ! [ cmd ]
-                let
-                    l =
-                        DebugF.log "App" "ClientRefresh"
-                in
-                    model ! []
-
             Stop _ ->
                 let
                     l =
@@ -205,18 +184,82 @@ update msg model =
                     model ! [ exitApp 0 ]
 
             ClientMsg msg ->
-                let
-                    l =
-                        DebugF.log "App" "ClientMsg"
-                in
-                    updateClient msg model
+                updateClient msg model
 
             StartWriting ->
                 let
                     l =
                         DebugF.log "App " "StartWriting"
+
+                    ( retryModel, cmd ) =
+                        pgConnect dbConnectionInfo model
+                in
+                    ({ model | retryModel = retryModel } ! [ cmd ])
+
+            StopWriting ->
+                let
+                    l =
+                        DebugF.log "App " "StopWriting"
                 in
                     model ! []
+
+            WriteEvent connectionId time ->
+                let
+                    l =
+                        Debug.log "WriteEvent" time
+
+                    cmd =
+                        Postgres.query WriteEventError WriteEventSuccess connectionId "SELECT * from events" 1
+                in
+                    model ! []
+
+            WriteEventSuccess ( connectionId, rowStrs ) ->
+                let
+                    l =
+                        Debug.log "EventSuccess" ( connectionId, rowStrs )
+                in
+                    model ! []
+
+            WriteEventError ( connectionId, error ) ->
+                let
+                    l =
+                        Debug.log "EventError" ( connectionId, error )
+                in
+                    model ! []
+
+            PGConnect connectionId ->
+                let
+                    l =
+                        DebugF.log "PGConnect" ("PGConnect:" +-+ connectionId)
+                in
+                    ({ model | maybeConnectionId = Just connectionId } ! [])
+
+            PGConnectError ( connectionId, error ) ->
+                model ! []
+
+            PGConnectionLost ( connectionId, error ) ->
+                model ! []
+
+            PGDisconnect connectionId ->
+                model ! []
+
+            PGDisconnectError ( connectionId, error ) ->
+                model ! []
+
+            RetryConnectCmd retryCount failureMsg cmd ->
+                let
+                    l =
+                        case failureMsg of
+                            PGConnectError ( _, error ) ->
+                                DebugF.log "RetryConnectCmd" ("Database Connnection Error:" +-+ "Error:" +-+ error +-+ "Connection Retry:" +-+ retryCount)
+
+                            _ ->
+                                Debug.crash "BUG -- Should never get here"
+                in
+                    (model ! [ cmd ])
+
+            RetryMsg msg ->
+                updateRetry msg model
 
 
 subscriptions : Model -> Sub Msg
@@ -225,14 +268,40 @@ subscriptions model =
         stopApp =
             externalStop Stop
 
-        -- dbWatcherSub =
-        --     interface.elmSubscriptions dbWatcherConfig model.dbWatcherModel
+        clientSub =
+            Client.subscriptions clientConfig model.clientModel
+
+        eventSub =
+            model.maybeConnectionId
+                |?> (\connectionId -> Time.every (5 * second) (WriteEvent connectionId))
+                ?= Sub.none
     in
-        stopApp
+        Sub.batch [ stopApp, clientSub, eventSub ]
 
 
+pgConnect : DbConnectionInfo -> Model -> ( Retry.Model Msg, Cmd Msg )
+pgConnect dbConnectionInfo model =
+    Retry.retry retryConfig model.retryModel PGConnectError RetryConnectCmd (connectCmd dbConnectionInfo)
 
--- model.running ? ( Sub.batch [ stopApp, dbWatcherSub ], stopApp )
+
+pgDisconnect : Maybe Int -> Cmd Msg
+pgDisconnect connectionId =
+    connectionId
+        |?> (\pgConnectionId -> Postgres.disconnect PGDisconnectError PGDisconnect pgConnectionId False)
+        ?= Cmd.none
+
+
+connectCmd : DbConnectionInfo -> FailureTagger ( ConnectionId, String ) Msg -> Cmd Msg
+connectCmd dbConnectionInfo failureTagger =
+    Postgres.connect failureTagger
+        PGConnect
+        PGConnectionLost
+        dbConnectionInfo.timeout
+        dbConnectionInfo.host
+        dbConnectionInfo.port_
+        dbConnectionInfo.database
+        dbConnectionInfo.user
+        dbConnectionInfo.password
 
 
 delayUpdateMsg : Msg -> Time -> Cmd Msg
@@ -240,32 +309,7 @@ delayUpdateMsg msg delay =
     Task.perform (\_ -> msg) <| Process.sleep delay
 
 
-createEntityEventTypes : Int -> List EntityEventTypes
-createEntityEventTypes queryId =
-    case queryId % 8 of
-        0 ->
-            [ ( "Person", [ ( "entity", "created", Nothing ), ( "property", "added", Just "name" ) ] ) ]
-
-        1 ->
-            [ ( "User", [ ( "entity", "created", Nothing ), ( "property", "added", Just "authenticationMethod" ) ] ) ]
-
-        2 ->
-            [ ( "Person", [ ( "relationship", "added", Just "address" ), ( "relationship", "removed", Just "address" ) ] ) ]
-
-        3 ->
-            [ ( "Person", [ ( "entity", "destroyed", Nothing ) ] ) ]
-
-        4 ->
-            [ ( "User", [ ( "entity", "created", Nothing ), ( "entity", "destroyed", Nothing ) ] ) ]
-
-        5 ->
-            [ ( "Person", [ ( "relationship", "added", Just "address" ) ] ) ]
-
-        6 ->
-            [ ( "BadEntity", [] ) ]
-
-        7 ->
-            []
-
-        _ ->
-            Debug.crash "This should never happen"
+insertStatements : List String
+insertStatements =
+    [ "SELECT insert_events($$($1[1], $2, '{\"target\": \"relationship\", \"version\": 0, \"entityId\": \"123\", \"metadata\": {\"command\": \"asOneCmd\", \"initiatorId\": \"999888777\"}, \"operation\": \"added\", \"entityName\": \"Person\", \"propertyName\": \"address\"}' )$$);"
+    ]
