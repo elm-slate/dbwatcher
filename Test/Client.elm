@@ -40,8 +40,8 @@ type Msg dbWatcherId dbWatcherMsg
     | DbWatcherLog ( LogLevel, String )
     | DbWatcherMsg dbWatcherMsg
     | DbWatcherRefresh (List dbWatcherId)
-    | DbWatcherStarted
-    | DbWatcherStopped
+    | DbWatcherStarted (Result String ())
+    | DbWatcherStopped (Result String ())
 
 
 type alias Model dbWatcherId dbWatcherModel =
@@ -92,14 +92,14 @@ update config msg model =
                 in
                     ( model ! [], [] )
 
-            DbWatcherStarted ->
+            DbWatcherStarted result ->
                 let
                     l =
                         DebugF.log "Client" "DbWatcherStarted"
                 in
                     subscribeOrStop config model
 
-            DbWatcherStopped ->
+            DbWatcherStopped result ->
                 let
                     l =
                         DebugF.log "Client" "DbWatcherStopped"

@@ -243,14 +243,14 @@ update config msg model =
                     newModel =
                         { model | watchedEntities = Dict.empty, maybeDbConnectionInfo = Nothing }
                 in
-                    ( newModel ! [], logInfo ("DbWatcher Stopped") :: [ config.clientInterface.stoppedMsg ] )
+                    ( newModel ! [], logInfo ("DbWatcher Stopped") :: [ config.clientInterface.stoppedMsg (Ok ()) ] )
 
             PGConnect cause pgConnectionId ->
                 let
                     ( newModel, cmd, appMsgs ) =
                         case cause of
                             StartingCause ->
-                                ( { model | pgListenConnectionId = Just pgConnectionId, pgListenError = False }, Cmd.none, [ config.clientInterface.startedMsg ] )
+                                ( { model | pgListenConnectionId = Just pgConnectionId, pgListenError = False }, Cmd.none, [ config.clientInterface.startedMsg (Ok ()) ] )
 
                             ReconnectCause ->
                                 model.running
