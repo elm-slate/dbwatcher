@@ -42,6 +42,11 @@ pgReconnectDelayInterval =
     10 * second
 
 
+writeEventDelayInterval : Time
+writeEventDelayInterval =
+    5 * second
+
+
 stopDelayInterval : Time
 stopDelayInterval =
     5 * second
@@ -89,11 +94,12 @@ type Msg
     | ClientLog ( LogLevel, String )
     | ClientMsg (Client.Msg QueryId DbWatcher.Msg)
     | ClientStop
+    | DoCmd (Cmd Msg)
     | Stop ()
     | ClientStopped
     | StartWriting
     | StopWriting
-    | WriteEvent Int Time
+    | WriteEvent Int
     | WriteEventSuccess ( Int, List String )
     | WriteEventError ( Int, String )
     | PGConnect Int
@@ -110,6 +116,8 @@ type alias Model =
     , clientModel : Client.Model QueryId (DbWatcher.Model QueryId)
     , retryModel : Retry.Model Msg
     , maybeConnectionId : Maybe Int
+    , countEvents : Int
+    , writingEvents : Bool
     }
 
 
@@ -123,6 +131,8 @@ initModel =
           , clientModel = clientModel
           , retryModel = Retry.initModel
           , maybeConnectionId = Nothing
+          , countEvents = 0
+          , writingEvents = False
           }
         , cmd
         )
@@ -148,17 +158,17 @@ update msg model =
                     l =
                         case errorType of
                             NonFatalError ->
-                                DebugF.log ("ClientError" +-+ errorType) details
+                                DebugF.log ("App ClientError" +-+ errorType) details
 
                             _ ->
-                                Debug.crash <| toString details
+                                Debug.crash <| details
                 in
                     model ! []
 
             ClientLog ( logLevel, details ) ->
                 let
                     l =
-                        DebugF.log ("ClientLog" +-+ logLevel) details
+                        DebugF.log ("App ClientLog" +-+ logLevel) details
                 in
                     model ! []
 
@@ -174,14 +184,17 @@ update msg model =
                     l =
                         DebugF.log "App " "ClientStopped"
                 in
-                    model ! [ exitApp 0 ]
+                    ({ model | writingEvents = False } ! [])
+
+            DoCmd cmd ->
+                (model ! [ cmd ])
 
             Stop _ ->
                 let
                     l =
-                        DebugF.log "App" "Stop"
+                        ( DebugF.log "App" "Stop", DebugF.log "Events Written" (toString model.countEvents) )
                 in
-                    model ! [ exitApp 0 ]
+                    model ! [ delayCmd (exitApp 0) stopDelayInterval ]
 
             ClientMsg msg ->
                 updateClient msg model
@@ -194,45 +207,66 @@ update msg model =
                     ( retryModel, cmd ) =
                         pgConnect dbConnectionInfo model
                 in
-                    ({ model | retryModel = retryModel } ! [ cmd ])
+                    ({ model | retryModel = retryModel, writingEvents = True } ! [ cmd ])
 
             StopWriting ->
                 let
                     l =
                         DebugF.log "App " "StopWriting"
                 in
-                    model ! []
+                    ({ model | writingEvents = False } ! [])
 
-            WriteEvent connectionId time ->
+            WriteEvent connectionId ->
                 let
+                    status =
+                        model.writingEvents
+                            ? ( "      Event #" +-+ (model.countEvents + 1)
+                              , "      Writing Events Stopped"
+                              )
+
                     l =
-                        Debug.log "WriteEvent" time
+                        Debug.log "App WriteEvent" ("connectionId" +-+ connectionId +-+ status)
+
+                    insertStatement =
+                        getInsertStatement model.countEvents insertStatements
 
                     cmd =
-                        Postgres.query WriteEventError WriteEventSuccess connectionId "SELECT * from events" 1
+                        model.writingEvents
+                            ? ( Postgres.query WriteEventError WriteEventSuccess connectionId insertStatement 10
+                              , delayUpdateMsg (Stop ()) stopDelayInterval
+                              )
                 in
-                    model ! []
+                    model ! [ cmd ]
 
             WriteEventSuccess ( connectionId, rowStrs ) ->
                 let
                     l =
-                        Debug.log "EventSuccess" ( connectionId, rowStrs )
+                        Debug.log "App WriteEventSuccess (connectionId, rows returned)" ( connectionId, rowStrs )
+
+                    countEvents =
+                        model.countEvents + 1
+
+                    cmd =
+                        (countEvents < List.length insertStatements)
+                            ? ( delayUpdateMsg (WriteEvent connectionId) writeEventDelayInterval
+                              , delayUpdateMsg (Stop ()) stopDelayInterval
+                              )
                 in
-                    model ! []
+                    ({ model | countEvents = countEvents } ! [ cmd ])
 
             WriteEventError ( connectionId, error ) ->
                 let
                     l =
-                        Debug.log "EventError" ( connectionId, error )
+                        Debug.log "App WriteEventError" ( connectionId, error )
                 in
-                    model ! []
+                    model ! [ exitApp 1 ]
 
             PGConnect connectionId ->
                 let
                     l =
-                        DebugF.log "PGConnect" ("PGConnect:" +-+ connectionId)
+                        DebugF.log "App PGConnect" ("PGConnect:" +-+ connectionId)
                 in
-                    ({ model | maybeConnectionId = Just connectionId } ! [])
+                    ({ model | maybeConnectionId = Just connectionId } ! [ delayUpdateMsg (WriteEvent connectionId) writeEventDelayInterval ])
 
             PGConnectError ( connectionId, error ) ->
                 model ! []
@@ -251,7 +285,7 @@ update msg model =
                     l =
                         case failureMsg of
                             PGConnectError ( _, error ) ->
-                                DebugF.log "RetryConnectCmd" ("Database Connnection Error:" +-+ "Error:" +-+ error +-+ "Connection Retry:" +-+ retryCount)
+                                DebugF.log "App RetryConnectCmd" ("Database Connnection Error:" +-+ "Error:" +-+ error +-+ "Connection Retry:" +-+ retryCount)
 
                             _ ->
                                 Debug.crash "BUG -- Should never get here"
@@ -270,13 +304,8 @@ subscriptions model =
 
         clientSub =
             Client.subscriptions clientConfig model.clientModel
-
-        eventSub =
-            model.maybeConnectionId
-                |?> (\connectionId -> Time.every (5 * second) (WriteEvent connectionId))
-                ?= Sub.none
     in
-        Sub.batch [ stopApp, clientSub, eventSub ]
+        Sub.batch [ stopApp, clientSub ]
 
 
 pgConnect : DbConnectionInfo -> Model -> ( Retry.Model Msg, Cmd Msg )
@@ -309,7 +338,41 @@ delayUpdateMsg msg delay =
     Task.perform (\_ -> msg) <| Process.sleep delay
 
 
+delayCmd : Cmd Msg -> Time -> Cmd Msg
+delayCmd cmd =
+    delayUpdateMsg <| DoCmd cmd
+
+
 insertStatements : List String
 insertStatements =
-    [ "SELECT insert_events($$($1[1], $2, '{\"target\": \"relationship\", \"version\": 0, \"entityId\": \"123\", \"metadata\": {\"command\": \"asOneCmd\", \"initiatorId\": \"999888777\"}, \"operation\": \"added\", \"entityName\": \"Person\", \"propertyName\": \"address\"}' )$$);"
+    [ "SELECT insert_events($$($1[1], $2, '{\"target\": \"entity\",\"version\": 0,\"entityId\": \"123\",\"metadata\": {\"command\": \"asOneCmd\", \"initiatorId\": \"999888777\" },\"operation\": \"created\",\"entityName\": \"Person\"}')$$);"
+    , "SELECT insert_events($$($1[1], $2, '{\"target\": \"entity\",\"version\": 0,\"entityId\": \"234\",\"metadata\": {\"command\": \"asOneCmd\", \"initiatorId\": \"999888777\" },\"operation\": \"created\",\"entityName\": \"Person\"}')$$);"
+    , "SELECT insert_events($$($1[1], $2, '{\"target\": \"entity\",\"version\": 0,\"entityId\": \"234\",\"metadata\": {\"command\": \"asOneCmd\", \"initiatorId\": \"999888777\" },\"operation\": \"created\",\"entityName\": \"Person\"}')$$);"
+    , "SELECT insert_events($$($1[1], $2, '{\"target\": \"entity\",\"version\": 0,\"entityId\": \"234\",\"metadata\": {\"command\": \"asOneCmd\", \"initiatorId\": \"999888777\" },\"operation\": \"created\",\"entityName\": \"Person\"}')$$);"
+    , "SELECT insert_events($$($1[1], $2, '{\"target\": \"entity\",\"version\": 0,\"entityId\": \"234\",\"metadata\": {\"command\": \"asOneCmd\", \"initiatorId\": \"999888777\" },\"operation\": \"created\",\"entityName\": \"Person\"}')$$);"
+    , "SELECT insert_events($$($1[1], $2, '{\"target\": \"relationship\", \"version\": 0, \"entityId\": \"123\", \"metadata\": {\"command\": \"asOneCmd\", \"initiatorId\": \"999888777\"}, \"operation\": \"added\", \"entityName\": \"Person\", \"propertyName\": \"address\"}' )$$);"
+    , "SELECT insert_events($$($1[1], $2, '{\"target\": \"relationship\",\"version\": 0,\"entityId\": \"123\",\"metadata\": {\"command\": \"asOneCmd\", \"initiatorId\": \"999888777\" },\"operation\": \"added\",\"propertyName\": \"address\",\"entityName\": \"Person\"}')$$);"
+    , "SELECT insert_events($$($1[1], $2, '{\"target\": \"entity\",\"version\": 0,\"entityId\": \"234\",\"metadata\": {\"command\": \"asOneCmd\", \"initiatorId\": \"999888777\" },\"operation\": \"destroyed\",\"entityName\": \"Person\"}')$$);"
+    , "SELECT insert_events($$($1[1], $2, '{\"target\": \"entity\",\"version\": 0,\"entityId\": \"123\",\"metadata\": {\"command\": \"asOneCmd\", \"initiatorId\": \"999888777\" },\"operation\": \"created\",\"entityName\": \"User\"}')$$);\n"
+    , "SELECT insert_events($$($1[1], $2, '{\"target\": \"entity\",\"version\": 0,\"entityId\": \"234\",\"metadata\": {\"command\": \"asOneCmd\", \"initiatorId\": \"999888777\" },\"operation\": \"destroyed\",\"entityName\": \"Person\"}')$$);"
+    , "SELECT insert_events($$($1[1], $2, '{\"target\": \"entity\",\"version\": 0,\"entityId\": \"123\",\"metadata\": {\"command\": \"asOneCmd\", \"initiatorId\": \"999888777\" },\"operation\": \"created\",\"entityName\": \"User\"}')$$);"
+    , "SELECT insert_events($$($1[1], $2, '{\"target\": \"entity\",\"version\": 0,\"entityId\": \"234\",\"metadata\": {\"command\": \"asOneCmd\", \"initiatorId\": \"999888777\" },\"operation\": \"created\",\"entityName\": \"Person\"}')$$);"
+    , "SELECT insert_events($$($1[1], $2, '{\"target\": \"entity\",\"version\": 0,\"entityId\": \"123\",\"metadata\": {\"command\": \"asOneCmd\", \"initiatorId\": \"999888777\" },\"operation\": \"created\",\"propertyName\": \"address\",\"entityName\": \"User\"}')$$);"
     ]
+
+
+getInsertStatement : Int -> List String -> String
+getInsertStatement targetIdx statements =
+    (List.indexedMap (\idx statement -> (idx == targetIdx) ? ( statement, "" )) statements)
+        |> (\newStatements -> List.filter (\statement -> not <| String.isEmpty statement) newStatements)
+        |> (\filteredStatements ->
+                case filteredStatements of
+                    statement :: [] ->
+                        statement
+
+                    _ :: _ ->
+                        Debug.crash ("BUG:  There should be only one statement in filteredStatements" +-+ filteredStatements)
+
+                    [] ->
+                        Debug.crash ("BUG:  There should be at least one statement in filteredStatements" +-+ filteredStatements)
+           )

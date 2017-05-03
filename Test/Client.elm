@@ -78,17 +78,17 @@ update config msg model =
                     l =
                         case errorType of
                             NonFatalError ->
-                                DebugF.log ("DbWatcherError" +-+ errorType) details
+                                DebugF.log ("Client DbWatcherError" +-+ errorType) details
 
                             _ ->
-                                Debug.crash <| toString details
+                                Debug.crash details
                 in
                     ( model ! [], [] )
 
             DbWatcherLog ( logLevel, details ) ->
                 let
                     l =
-                        DebugF.log ("DbWatcherLog" +-+ logLevel) details
+                        DebugF.log ("Client DbWatcherLog" +-+ logLevel) details
                 in
                     ( model ! [], [] )
 
@@ -137,7 +137,7 @@ subscribeOrStop config model =
         |> (\( maybeTestId, testIds, entityEventTypes, countSubscribedOrStopped ) ->
                 maybeTestId
                     |?> (\testId ->
-                            config.interface.subscribe config.dbWatcherConfig model.dbWatcherModel entityEventTypes testId
+                            config.interface.subscribe config.dbWatcherConfig model.dbWatcherModel entityEventTypes (Debug.log "Client subscribing testId" testId)
                                 |??> (\( dbWatcherModel, cmd ) -> ( ( { model | running = True, dbWatcherModel = dbWatcherModel, testIds = testIds, countSubscribedOrStopped = countSubscribedOrStopped }, cmd ), (model.countSubscribedOrStopped == 0) ? ( [ config.startWritingMsg ], [] ) ))
                                 ??= (\errors -> ( ( { model | testIds = testIds, countSubscribedOrStopped = countSubscribedOrStopped }, delayUpdateMsg (DbWatcherError ( NonFatalError, (String.join "," errors) )) 0 ), [] ))
                         )
