@@ -243,7 +243,7 @@ update config msg model =
                     newModel =
                         { model | watchedEntities = Dict.empty, maybeDbConnectionInfo = Nothing }
                 in
-                    ( newModel ! [], logInfo ("DbWatcher Stopped.  Model:" +-+ newModel) :: [ config.clientInterface.stoppedMsg ] )
+                    ( newModel ! [], logInfo ("DbWatcher Stopped") :: [ config.clientInterface.stoppedMsg ] )
 
             PGConnect cause pgConnectionId ->
                 let
