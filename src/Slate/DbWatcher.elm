@@ -97,7 +97,7 @@ retryConfig : Retry.Config Msg
 retryConfig =
     { retryMax = 3
     , delayNext = Retry.constantDelay 5000
-    , routeToMeTagger = RetryModule
+    , routeToMeTagger = RetryMsg
     }
 
 
@@ -116,7 +116,7 @@ type Msg
     | PGListenError ( Int, String )
     | PGListenEvent ( Int, String, String )
     | RetryConnectCmd Int Msg (Cmd Msg)
-    | RetryModule (Retry.Msg Msg)
+    | RetryMsg (Retry.Msg Msg)
 
 
 {-| Model
@@ -243,7 +243,7 @@ update config msg model =
                     newModel =
                         { model | watchedEntities = Dict.empty, maybeDbConnectionInfo = Nothing }
                 in
-                    ( newModel ! [], logInfo ("DbWatcher Stopped") :: [ config.clientInterface.stoppedMsg (Ok ()) ] )
+                    ( newModel ! [], [ config.clientInterface.stoppedMsg (Ok ()) ] )
 
             PGConnect cause pgConnectionId ->
                 let
@@ -265,9 +265,6 @@ update config msg model =
 
             PGConnectError cause ( _, pgError ) ->
                 let
-                    error =
-                        "Cannot connect to Database after" +-+ retryConfig.retryMax +-+ "attempt(s)." +-+ pgError +-+ "Cause:" +-+ cause
-
                     ( newRetryModel, cmd ) =
                         model.running
                             ? ( let
@@ -278,44 +275,33 @@ update config msg model =
                               , ( model.retryModel, Cmd.none )
                               )
                 in
-                    ( { model | pgListenConnectionId = Nothing, retryModel = newRetryModel } ! [ cmd ], [ nonFatal error ] )
+                    ( { model | pgListenConnectionId = Nothing, retryModel = newRetryModel } ! [ cmd ], [ nonFatal <| "Cannot connect to Database after" +-+ retryConfig.retryMax +-+ "attempt(s)." +-+ pgError +-+ "Cause:" +-+ cause ] )
 
             PGConnectionLost ( pgConnectionId, pgError ) ->
                 let
-                    error =
-                        "PGConnectionLost:" +-+ ( pgConnectionId, pgError ) +-+ "Running:" +-+ model.running
-
                     ( retryModel, cmd ) =
                         model.running
                             ? ( pgConnect config (dbConnectionInfo model) model ReconnectCause
                               , ( model.retryModel, Cmd.none )
                               )
                 in
-                    ( { model | pgListenConnectionId = Nothing, retryModel = retryModel } ! [ cmd ], [ nonFatal error ] )
+                    ( { model | pgListenConnectionId = Nothing, retryModel = retryModel } ! [ cmd ], [ nonFatal <| "PGConnectionLost:" +-+ ( pgConnectionId, pgError ) +-+ "Running:" +-+ model.running ] )
 
             PGDisconnectError cause ( pgConnectionId, pgError ) ->
-                let
-                    error =
-                        "PGDisconnectError:" +-+ ( pgConnectionId, pgError ) +-+ "Cause:" +-+ cause
-                in
-                    case cause of
-                        StoppingCause ->
-                            update config Stopped { model | pgListenConnectionId = Nothing }
+                case cause of
+                    StoppingCause ->
+                        update config Stopped { model | pgListenConnectionId = Nothing }
 
-                        StopAfterConnectCause ->
-                            ( model ! [], [ nonFatal error ] )
+                    StopAfterConnectCause ->
+                        ( model ! [], [ nonFatal <| "PGDisconnectError:" +-+ ( pgConnectionId, pgError ) +-+ "Cause:" +-+ cause ] )
 
             PGDisconnect cause pgConnectionId ->
-                let
-                    message =
-                        "PGDisconnect:" +-+ pgConnectionId +-+ "Cause:" +-+ cause
-                in
-                    case cause of
-                        StoppingCause ->
-                            update config Stopped { model | pgListenConnectionId = Nothing }
+                case cause of
+                    StoppingCause ->
+                        update config Stopped { model | pgListenConnectionId = Nothing }
 
-                        StopAfterConnectCause ->
-                            ( model ! [], [ logInfo message ] )
+                    StopAfterConnectCause ->
+                        ( model ! [], [ logInfo <| "PGDisconnect:" +-+ pgConnectionId +-+ "Cause:" +-+ cause ] )
 
             PGListenSuccess ( connectionId, channelName, listenUnlisten ) ->
                 ( model ! [], [ logInfo <| "PGListenSuccess:" +-+ ( connectionId, channelName, listenUnlisten ) ] )
@@ -370,7 +356,7 @@ update config msg model =
                 in
                     ( model ! [ cmd ], [ parentMsg ] )
 
-            RetryModule msg ->
+            RetryMsg msg ->
                 updateRetry msg model
 
 
