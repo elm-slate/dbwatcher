@@ -68,11 +68,11 @@ dbWatcherConfig : DbWatcher.Config Msg
 dbWatcherConfig =
     { pgReconnectDelayInterval = pgReconnectDelayInterval
     , stopDelayInterval = stopDelayInterval
-    , invalidId = (\queryId -> queryId < 0)
     , errorTagger = DbWatcherError
     , logTagger = DbWatcherLog
     , routeToMeTagger = DbWatcherMsg
     , refreshTagger = DbWatcherRefresh
+    , debug = True
     }
 
 
