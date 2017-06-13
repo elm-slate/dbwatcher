@@ -1,5 +1,5 @@
 {
-    "version": "0.0.9", 
+    "version": "1.0.0",
     "summary": "",
     "repository": "https://github.com/elm-slate/dbwatcher.git",
     "license": "Unlicense",
@@ -12,15 +12,15 @@
     ],
     "dependencies": {
         "elm-lang/core": "5.0.0 <= v < 6.0.0",
+        "elm-community/result-extra": "2.0.0 <= v < 3.0.0",
         "panosoft/elm-debugf": "2.0.0 <= v < 3.0.0",
         "panosoft/elm-string-utils": "2.0.0 <= v < 3.0.0",
         "panosoft/elm-utils": "2.0.0 <= v < 3.0.0",
         "panosoft/elm-parent-child-update": "2.0.0 <= v < 3.0.0",
         "panosoft/elm-postgres": "4.0.0 <= v < 5.0.0",
         "panosoft/elm-cmd-retry": "3.0.0 <= v < 4.0.0",
-        "elm-slate/common": "1.0.0 <= v < 2.0.0",
-        "elm-slate/query": "2.0.0 <= v < 3.0.0",
-        "elm-slate/dbwatcher-common": "0.0.6 <= v <= 0.0.6"
+        "elm-slate/common": "2.0.0 <= v < 3.0.0",
+        "elm-slate/query": "2.0.0 <= v < 3.0.0"
     },
     "elm-version": "0.18.0 <= v < 0.19.0"
 }

@@ -1,6 +1,9 @@
 // compile with:
 //		elm make Test/App.elm --output elm.js
 
+// tell Postgres to use PGProxy
+process.env.CLIENT = true;
+
 // load Elm module
 const elm = require('./elm.js');
 

@@ -3,55 +3,39 @@ module Slate.DbWatcher
         ( Msg
         , Model
         , Config
-        , interface
         , init
         , start
         , stop
+        , update
         , subscribe
         , unsubscribe
-        , update
+        , unsubscribeAll
         , elmSubscriptions
         )
 
 {-| Slate Database Watcher.
 
-@docs Msg , Model , Config , interface, init , start , stop , subscribe , unsubscribe , update , elmSubscriptions
+@docs Msg , Model , Config, Msg , Model , Config , init , start , stop , update , subscribe , unsubscribe , unsubscribeAll, elmSubscriptions
 -}
 
+import Task
 import Dict exposing (Dict)
 import Time exposing (Time)
-import Process
-import Task exposing (Task)
 import Json.Decode as JD exposing (..)
+import Result.Extra as Result exposing (..)
 import Postgres exposing (..)
 import StringUtils exposing (..)
 import Retry exposing (..)
 import Utils.Ops exposing (..)
 import Utils.Error exposing (..)
 import Utils.Log exposing (..)
-import Utils.Json exposing ((<||))
 import ParentChildUpdate exposing (..)
 import Slate.Common.Db exposing (..)
 import Slate.Common.Event exposing (..)
 import Slate.Common.Entity exposing (..)
-import Slate.DbWatcher.Common.Interface exposing (..)
-
-
-type alias WatchedEntitiesDict comparable =
-    Dict comparable (List EntityEventTypes)
-
-
-type alias ListenPayload =
-    { event : Event
-    }
-
-
-type alias Event =
-    { entityName : String
-    , target : String
-    , operation : String
-    , propertyName : Maybe String
-    }
+import Slate.Engine.Query exposing (..)
+import Slate.Common.Taggers exposing (..)
+import DebugF
 
 
 type ConnectCause
@@ -69,319 +53,120 @@ channelName =
     "eventsinsert"
 
 
-{-| Interface to the DbWatcher
+{-| Referesh tagger
 -}
-interface : Interface (Config comparable msg) (Model comparable) comparable Msg msg
-interface =
-    { init = init
-    , update = update
-    , start = start
-    , stop = stop
-    , subscribe = subscribe
-    , unsubscribe = unsubscribe
-    , elmSubscriptions = elmSubscriptions
-    }
+type alias RefreshTagger msg =
+    List QueryId -> msg
 
 
 {-| Config
 -}
-type alias Config comparable msg =
+type alias Config msg =
     { pgReconnectDelayInterval : Time
     , stopDelayInterval : Time
-    , invalidId : comparable -> Bool
-    , clientInterface : ClientInterface comparable Msg msg
+    , errorTagger : ErrorTagger String msg
+    , logTagger : LogTagger String msg
+    , routeToMeTagger : Msg -> msg
+    , refreshTagger : RefreshTagger msg
+    , debug : Bool
     }
 
 
-retryConfig : Retry.Config Msg
-retryConfig =
-    { retryMax = 3
+retryConfig : DbConnectionInfo -> Retry.Config Msg
+retryConfig dbConnectionInfo =
+    { retryMax = 3000
     , delayNext = Retry.constantDelay 5000
-    , routeToMeTagger = RetryMsg
+    , routeToMeTagger = RetryMsg dbConnectionInfo
     }
 
 
-{-| Msg
--}
-type Msg
-    = Nop
-    | Stopped
-    | DoCmd (Cmd Msg)
-    | PGConnect ConnectCause Int
-    | PGConnectError ConnectCause ( Int, String )
-    | PGConnectionLost ( Int, String )
-    | PGDisconnectError DisconnectCause ( Int, String )
-    | PGDisconnect DisconnectCause Int
-    | PGListenSuccess ( Int, String, ListenUnlisten )
-    | PGListenError ( Int, String )
-    | PGListenEvent ( Int, String, String )
-    | RetryConnectCmd Int Msg (Cmd Msg)
-    | RetryMsg (Retry.Msg Msg)
+type alias WatcherClientInfo =
+    { entityEventTypes : List EntityEventTypes
+    , dbConnectionInfo : DbConnectionInfo
+    }
+
+
+type alias WatchedEntitiesDict =
+    Dict QueryId WatcherClientInfo
 
 
 {-| Model
 -}
-type alias Model comparable =
-    { watchedEntities : WatchedEntitiesDict comparable
-    , maybeDbConnectionInfo : Maybe DbConnectionInfo
+type alias Model =
+    { connectedDbConnections : Dict String { dbConnectionInfo : DbConnectionInfo, connectionId : ConnectionId }
+    , watchedEntities : WatchedEntitiesDict
+    , retryModels : Dict String (Retry.Model Msg)
     , running : Bool
-    , pgListenConnectionId : Maybe Int
-    , pgListenError : Bool
-    , retryModel : Retry.Model Msg
     }
 
 
 {-| init DbWatcher
 -}
-init : Config comparable msg -> ( Model comparable, Cmd msg )
+init : Config msg -> ( Model, Cmd msg )
 init config =
-    ({ watchedEntities = Dict.empty
-     , maybeDbConnectionInfo = Nothing
-     , running = False
-     , pgListenConnectionId = Nothing
-     , pgListenError = False
-     , retryModel = Retry.initModel
-     }
+    { connectedDbConnections = Dict.empty
+    , watchedEntities = Dict.empty
+    , retryModels = Dict.empty
+    , running = False
+    }
         ! []
-    )
 
 
-
-{-
-   API
+{-| start watching
 -}
-
-
-{-| start DbWatcher
--}
-start : Config comparable msg -> DbConnectionInfo -> Model comparable -> Result String ( Model comparable, Cmd msg )
-start config dbConnectionInfo model =
-    model.running
-        ? ( Err "Already Started"
-          , Ok
-                (let
-                    ( retryModel, cmd ) =
+start : Config msg -> Model -> List DbConnectionInfo -> ( Model, Cmd msg )
+start config model dbConnectionInfos =
+    not model.running
+        ? ( dbConnectionInfos
+                |> List.foldl
+                    (\dbConnectionInfo ( model, cmds ) ->
                         pgConnect config dbConnectionInfo model StartingCause
-                 in
-                    ( { model | running = True, watchedEntities = Dict.empty, retryModel = retryModel, maybeDbConnectionInfo = Just dbConnectionInfo }, Cmd.map config.clientInterface.routeToMeTagger cmd )
-                )
+                            |> (\( retryModel, retryCmd ) -> ( setRetryModel dbConnectionInfo model retryModel, Cmd.map config.routeToMeTagger retryCmd :: cmds ))
+                    )
+                    ( model, [] )
+                |> (\( model, cmds ) -> { model | running = True } ! cmds)
+          , model ! []
           )
 
 
-{-| stop DbWatcher
+{-| stop watching
 -}
-stop : Config comparable msg -> Model comparable -> Result String ( Model comparable, Cmd msg )
+stop : Config msg -> Model -> ( Model, Cmd msg )
 stop config model =
-    let
-        cmd =
-            let
-                disconnectOrStop stopDelay =
-                    Cmd.map config.clientInterface.routeToMeTagger <|
-                        model.pgListenConnectionId
-                            |?> (\pgConnectionId -> delayCmd (pgDisconnect model.pgListenConnectionId StoppingCause) stopDelay)
-                            ?= delayUpdateMsg stopDelay Stopped
-
-                logError errorType error =
-                    config.clientInterface.errorTagger ( errorType, error )
-                        |> delayUpdateMsg 0
-            in
-                model.running
-                    ? ( disconnectOrStop config.stopDelayInterval
-                      , (let
-                            logCmd =
-                                model.pgListenConnectionId
-                                    |?> (\connectionId -> logError NonFatalError ("BUG -- Postgres connectionId:" +-+ connectionId +-+ " still exists when not running"))
-                                    ?= Cmd.none
-                         in
-                            Cmd.batch [ disconnectOrStop 0, logCmd ]
+    model.running
+        ? ( unsubscribeAll config model, model )
+        |> (\model ->
+                model.connectedDbConnections
+                    |> Dict.values
+                    |> List.map .connectionId
+                    |> List.foldl
+                        (\connectionId ( model, cmds ) ->
+                            pgDisconnect model connectionId StoppingCause
+                                |> (\cmd -> ( model, Cmd.map config.routeToMeTagger cmd :: cmds ))
                         )
-                      )
-    in
-        Ok ({ model | running = False, watchedEntities = Dict.empty, pgListenConnectionId = Nothing, pgListenError = False } ! [ cmd ])
+                        ( model, [] )
+                    |> (\( model, cmds ) -> { model | running = False } ! cmds)
+           )
+
+
+setRetryModel : DbConnectionInfo -> Model -> Retry.Model Msg -> Model
+setRetryModel dbConnectionInfo model retryModel =
+    { model | retryModels = Dict.insert (makeComparable dbConnectionInfo) retryModel model.retryModels }
+
+
+getRetryModel : DbConnectionInfo -> Model -> Retry.Model Msg
+getRetryModel dbConnectionInfo model =
+    makeComparable dbConnectionInfo
+        |> (\dbConnectionInfoStr ->
+                Dict.get dbConnectionInfoStr model.retryModels
+                    ?!= (\_ -> Debug.crash ("Cannot find retryModel for:" +-+ dbConnectionInfoStr +-+ "Retry models:" +-+ model.retryModels))
+           )
 
 
 {-| subscribe to DbWatcher
 -}
-subscribe : Config comparable msg -> Model comparable -> List EntityEventTypes -> comparable -> Result (List String) ( Model comparable, Cmd msg )
-subscribe config model entityEventTypesList comparable =
-    createSubscriber config entityEventTypesList model comparable
-
-
-{-| unsubscribe to DbWatcher
--}
-unsubscribe : Config comparable msg -> Model comparable -> comparable -> Result (List String) ( Model comparable, Cmd msg )
-unsubscribe config model comparable =
-    destroySubscriber model comparable
-
-
-{-| update
--}
-update : Config comparable msg -> Msg -> Model comparable -> ( ( Model comparable, Cmd Msg ), List msg )
-update config msg model =
-    let
-        logInfo message =
-            config.clientInterface.logTagger ( LogLevelInfo, message )
-
-        nonFatal error =
-            config.clientInterface.errorTagger ( NonFatalError, error )
-
-        dbConnectionInfo model =
-            model.maybeDbConnectionInfo ?!= (\_ -> Debug.crash "BUG: model.maybeDbConnectionInfo cannot be Nothing")
-
-        updateRetry =
-            updateChildParent (Retry.update retryConfig) (update config) .retryModel retryConfig.routeToMeTagger (\model retryModel -> { model | retryModel = retryModel })
-    in
-        case msg of
-            Nop ->
-                ( model ! [], [] )
-
-            DoCmd cmd ->
-                ( model ! [ cmd ], [] )
-
-            Stopped ->
-                let
-                    newModel =
-                        { model | watchedEntities = Dict.empty, maybeDbConnectionInfo = Nothing }
-                in
-                    ( newModel ! [], [ config.clientInterface.stoppedMsg (Ok ()) ] )
-
-            PGConnect cause pgConnectionId ->
-                let
-                    ( newModel, cmd, appMsgs ) =
-                        case cause of
-                            StartingCause ->
-                                ( { model | pgListenConnectionId = Just pgConnectionId, pgListenError = False }, Cmd.none, [ config.clientInterface.startedMsg (Ok ()) ] )
-
-                            ReconnectCause ->
-                                model.running
-                                    ? ( ( { model | pgListenConnectionId = Just pgConnectionId, pgListenError = False }, Cmd.none, [] )
-                                      , ( model, (pgDisconnect model.pgListenConnectionId StopAfterConnectCause), [] )
-                                      )
-
-                    finalAppMsgs =
-                        logInfo ("PGConnect:" +-+ pgConnectionId +-+ "Cause:" +-+ cause) :: appMsgs
-                in
-                    ( newModel ! [ cmd ], finalAppMsgs )
-
-            PGConnectError cause ( _, pgError ) ->
-                let
-                    ( newRetryModel, cmd ) =
-                        model.running
-                            ? ( let
-                                    ( retryModel, cmd ) =
-                                        pgConnect config (dbConnectionInfo model) model cause
-                                in
-                                    ( retryModel, delayCmd cmd config.pgReconnectDelayInterval )
-                              , ( model.retryModel, Cmd.none )
-                              )
-                in
-                    ( { model | pgListenConnectionId = Nothing, retryModel = newRetryModel } ! [ cmd ], [ nonFatal <| "Cannot connect to Database after" +-+ retryConfig.retryMax +-+ "attempt(s)." +-+ pgError +-+ "Cause:" +-+ cause ] )
-
-            PGConnectionLost ( pgConnectionId, pgError ) ->
-                let
-                    ( retryModel, cmd ) =
-                        model.running
-                            ? ( pgConnect config (dbConnectionInfo model) model ReconnectCause
-                              , ( model.retryModel, Cmd.none )
-                              )
-                in
-                    ( { model | pgListenConnectionId = Nothing, retryModel = retryModel } ! [ cmd ], [ nonFatal <| "PGConnectionLost:" +-+ ( pgConnectionId, pgError ) +-+ "Running:" +-+ model.running ] )
-
-            PGDisconnectError cause ( pgConnectionId, pgError ) ->
-                case cause of
-                    StoppingCause ->
-                        update config Stopped { model | pgListenConnectionId = Nothing }
-
-                    StopAfterConnectCause ->
-                        ( model ! [], [ nonFatal <| "PGDisconnectError:" +-+ ( pgConnectionId, pgError ) +-+ "Cause:" +-+ cause ] )
-
-            PGDisconnect cause pgConnectionId ->
-                case cause of
-                    StoppingCause ->
-                        update config Stopped { model | pgListenConnectionId = Nothing }
-
-                    StopAfterConnectCause ->
-                        ( model ! [], [ logInfo <| "PGDisconnect:" +-+ pgConnectionId +-+ "Cause:" +-+ cause ] )
-
-            PGListenSuccess ( connectionId, channelName, listenUnlisten ) ->
-                ( model ! [], [ logInfo <| "PGListenSuccess:" +-+ ( connectionId, channelName, listenUnlisten ) ] )
-
-            PGListenError ( connectionId, pgError ) ->
-                ( { model | pgListenError = True } ! [], [ nonFatal <| "PGListenError:" +-+ ( connectionId, pgError ) ] )
-
-            PGListenEvent ( connectionId, channelName, pgMessage ) ->
-                let
-                    listenPayloadDecodedResult =
-                        JD.decodeString listenPayloadDecoder pgMessage
-
-                    ( entityName, refreshList, error ) =
-                        model.running
-                            ? ( listenPayloadDecodedResult
-                                    |??>
-                                        (\payload ->
-                                            ( payload.event.entityName
-                                            , createRefreshList config payload.event.entityName payload.event.target payload.event.operation payload.event.propertyName model.watchedEntities
-                                            , ""
-                                            )
-                                        )
-                                    ??= (\err -> ( "", [], "Listen payload event.entityName not found:" +-+ err ))
-                              , listenPayloadDecodedResult
-                                    |??>
-                                        (\payload ->
-                                            ( "", [], "DbWatcher not running, listen event" +-+ payload.event.entityName +-+ "not processed" )
-                                        )
-                                    ??= (\err ->
-                                            ( "", [], "DbWatcher not running, listen event not processed.  Listen payload event.entityName not found:" +-+ err )
-                                        )
-                              )
-
-                    msgs =
-                        (String.length error > 0)
-                            ? ( [ nonFatal error ]
-                              , (List.length refreshList > 0)
-                                    ? ( [ config.clientInterface.refreshTagger refreshList ], [] )
-                              )
-                in
-                    ( model ! [], msgs )
-
-            RetryConnectCmd retryCount failureMsg cmd ->
-                let
-                    parentMsg =
-                        case failureMsg of
-                            PGConnectError cause ( _, error ) ->
-                                nonFatal ("Database Connnection Error:" +-+ "Error:" +-+ error +-+ "Connection Retry:" +-+ retryCount)
-
-                            _ ->
-                                Debug.crash "BUG -- Should never get here"
-                in
-                    ( model ! [ cmd ], [ parentMsg ] )
-
-            RetryMsg msg ->
-                updateRetry msg model
-
-
-{-|
-    subscriptions
--}
-elmSubscriptions : Config comparable msg -> Model comparable -> Sub msg
-elmSubscriptions config model =
-    let
-        pgSub =
-            model.pgListenConnectionId
-                |?> (\pgConnectionId -> model.pgListenError ? ( Sub.none, Postgres.listen PGListenError PGListenSuccess PGListenEvent pgConnectionId channelName ))
-                ?= Sub.none
-    in
-        model.running ? ( Sub.map config.clientInterface.routeToMeTagger pgSub, Sub.none )
-
-
-
-{-
-   Helpers
--}
-
-
-createSubscriber : Config comparable msg -> List EntityEventTypes -> Model comparable -> comparable -> Result (List String) ( Model comparable, Cmd msg )
-createSubscriber config entityEventTypesList model targetDbWatcherId =
+subscribe : Config msg -> DbConnectionInfo -> Model -> List EntityEventTypes -> QueryId -> Result (List String) ( Model, Cmd msg )
+subscribe config dbConnectionInfo model entityEventTypesList queryId =
     let
         initialErrors =
             List.isEmpty entityEventTypesList ? ( [ "no entityEventTypes exist" ], [] )
@@ -389,7 +174,7 @@ createSubscriber config entityEventTypesList model targetDbWatcherId =
         validate ( entityName, eventTypes ) errors =
             let
                 validations =
-                    [ ( config.invalidId targetDbWatcherId, "dbWatcherId is not valid:" +-+ targetDbWatcherId )
+                    [ ( queryId < 0, "dbWatcherId is not valid:" +-+ queryId )
                     , ( List.isEmpty eventTypes, "no event types exist for" +-+ entityName )
                     ]
             in
@@ -403,29 +188,252 @@ createSubscriber config entityEventTypesList model targetDbWatcherId =
         errors =
             List.foldl validate initialErrors entityEventTypesList
     in
-        case errors of
-            [] ->
-                Ok ( { model | watchedEntities = Dict.insert targetDbWatcherId entityEventTypesList model.watchedEntities }, Cmd.none )
-
-            _ :: _ ->
-                Err errors
-
-
-destroySubscriber : Model comparable -> comparable -> Result (List String) ( Model comparable, Cmd msg )
-destroySubscriber model targetcomparable =
-    case Dict.get targetcomparable model.watchedEntities of
-        Just _ ->
-            Ok ( { model | watchedEntities = Dict.remove targetcomparable model.watchedEntities }, Cmd.none )
-
-        Nothing ->
-            Err [ "Cannot unsubscribe watcher id" +-+ targetcomparable +-+ "that does not exist" ]
+        Dict.insert queryId { entityEventTypes = entityEventTypesList, dbConnectionInfo = dbConnectionInfo } model.watchedEntities
+            |> (\watchedEntities ->
+                    config.debug
+                        ? ( DebugF.log "*** DEBUG DbWatcher watchedEntities (post subscribe)" watchedEntities, Dict.empty )
+                        |> always
+                            ((errors == [])
+                                ? ( Ok ( { model | watchedEntities = watchedEntities }, Cmd.none )
+                                  , Err errors
+                                  )
+                            )
+               )
 
 
-createRefreshList : Config comparable msg -> EntityName -> Target -> Operation -> Maybe PropertyName -> WatchedEntitiesDict comparable -> List comparable
-createRefreshList config compareEntityName compareTarget compareOperation comparePropertyName watchedEntities =
+{-| unsubscribe to DbWatcher
+-}
+unsubscribe : Config msg -> Model -> QueryId -> Result (List String) ( Model, Cmd msg )
+unsubscribe config model queryId =
+    Dict.get queryId model.watchedEntities
+        |?> (\_ ->
+                Dict.remove queryId model.watchedEntities
+                    |> (\watchedEntities ->
+                            config.debug
+                                ? ( DebugF.log "*** DEBUG DbWatcher watchedEntities (post unsubscribe)" watchedEntities, Dict.empty )
+                                |> always (Ok ( { model | watchedEntities = watchedEntities }, Cmd.none ))
+                       )
+            )
+        ?= Err [ "Cannot unsubscribe watcher queryId:" +-+ queryId +-+ "that does not exist" ]
+
+
+{-| unsubscribe all from DbWatcher
+-}
+unsubscribeAll : Config msg -> Model -> Model
+unsubscribeAll config model =
+    { model | watchedEntities = Dict.empty }
+
+
+{-| Msg
+-}
+type Msg
+    = Nop
+    | Stopped
+    | DoCmd (Cmd Msg)
+    | PGConnect ConnectCause DbConnectionInfo ConnectionId
+    | PGConnectError DbConnectionInfo ( ConnectionId, String )
+    | PGConnectionLost DbConnectionInfo ( ConnectionId, String )
+    | PGDisconnectError DisconnectCause DbConnectionInfo ( ConnectionId, String )
+    | PGDisconnect DisconnectCause DbConnectionInfo ConnectionId
+    | PGListenSuccess ( ConnectionId, String, ListenUnlisten )
+    | PGListenError DbConnectionInfo ( ConnectionId, String )
+    | PGListenEvent ( ConnectionId, String, String )
+    | RetryConnectCmd DbConnectionInfo Int Msg (Cmd Msg)
+    | RetryMsg DbConnectionInfo (Retry.Msg Msg)
+
+
+{-| update
+-}
+update : Config msg -> Msg -> Model -> ( ( Model, Cmd Msg ), List msg )
+update config msg model =
+    let
+        logInfo message =
+            config.logTagger ( LogLevelInfo, message )
+
+        logDebug message =
+            config.logTagger ( LogLevelDebug, message )
+
+        nonFatal error =
+            config.errorTagger ( NonFatalError, error )
+
+        fatal error =
+            config.errorTagger ( FatalError, error )
+
+        disconnected cause dbConnectionInfo pgConnectionId model disonnectMsgs =
+            setUnconnected dbConnectionInfo pgConnectionId model
+                |> (\model ->
+                        case cause of
+                            StoppingCause ->
+                                ((List.length <| Dict.keys model.connectedDbConnections) == 0)
+                                    ? ( update config Stopped model, ( model ! [], [] ) )
+                                    |> (\( ( model, cmd ), msgs ) -> ( ( model, cmd ), List.append disonnectMsgs msgs ))
+
+                            StopAfterConnectCause ->
+                                ( model ! [], disonnectMsgs )
+                   )
+
+        setConnected dbConnectionInfo pgConnectionId model =
+            { model | connectedDbConnections = Dict.insert (makeComparable dbConnectionInfo) { connectionId = pgConnectionId, dbConnectionInfo = dbConnectionInfo } model.connectedDbConnections }
+
+        setUnconnected dbConnectionInfo pgConnectionId model =
+            { model | connectedDbConnections = Dict.remove (makeComparable dbConnectionInfo) model.connectedDbConnections }
+
+        updateRetry dbConnectionInfo =
+            updateChildParent (Retry.update (retryConfig dbConnectionInfo)) (update config) (getRetryModel dbConnectionInfo) (retryConfig dbConnectionInfo).routeToMeTagger (setRetryModel dbConnectionInfo)
+    in
+        case msg of
+            Nop ->
+                ( model ! [], [] )
+
+            DoCmd cmd ->
+                ( model ! [ cmd ], [] )
+
+            Stopped ->
+                ( { model | watchedEntities = Dict.empty } ! [], [] )
+
+            PGConnect cause dbConnectionInfo pgConnectionId ->
+                setConnected dbConnectionInfo pgConnectionId model
+                    |> (\model ->
+                            (case cause of
+                                StartingCause ->
+                                    ( Cmd.none, [] )
+
+                                ReconnectCause ->
+                                    makeComparable dbConnectionInfo
+                                        |> (\dbConnectionInfoStr ->
+                                                model.watchedEntities
+                                                    |> Dict.filter (\_ { dbConnectionInfo } -> makeComparable dbConnectionInfo == dbConnectionInfoStr)
+                                                    |> Dict.keys
+                                                    |> (\refreshList -> model.running ? ( ( Cmd.none, [ config.refreshTagger refreshList ] ), ( pgDisconnect model pgConnectionId StopAfterConnectCause, [] ) ))
+                                           )
+                            )
+                                |> (\( cmd, msgs ) -> ( model ! [ cmd ], List.append msgs [ logDebug ("PGConnect:" +-+ pgConnectionId +-+ "Cause:" +-+ cause) ] ))
+                       )
+
+            PGConnectError dbConnectionInfo ( _, pgError ) ->
+                ( model ! [], [ fatal ("Cannot connect to Database after" +-+ (retryConfig dbConnectionInfo).retryMax +-+ "attempt(s)." +-+ pgError) ] )
+
+            PGConnectionLost dbConnectionInfo ( pgConnectionId, pgError ) ->
+                setUnconnected dbConnectionInfo pgConnectionId model
+                    |> (\model ->
+                            model.running
+                                ? ( pgConnect config dbConnectionInfo model ReconnectCause
+                                        |> (\( retryModel, cmd ) -> setRetryModel dbConnectionInfo model retryModel ! [ cmd ])
+                                  , model ! []
+                                  )
+                       )
+                    |> (\( model, cmd ) -> ( model ! [ cmd ], [ nonFatal <| "PGConnectionLost:" +-+ ( pgConnectionId, pgError ) ] ))
+
+            PGDisconnectError cause dbConnectionInfo ( pgConnectionId, pgError ) ->
+                ([ nonFatal <| "PGDisconnectError:" +-+ ( pgConnectionId, pgError ) +-+ "Cause:" +-+ cause ])
+                    |> disconnected cause dbConnectionInfo pgConnectionId model
+
+            PGDisconnect cause dbConnectionInfo pgConnectionId ->
+                ([ logDebug <| "PGDisconnect:" +-+ pgConnectionId +-+ "Cause:" +-+ cause ])
+                    |> disconnected cause dbConnectionInfo pgConnectionId model
+
+            PGListenSuccess ( pgConnectionId, channelName, listenUnlisten ) ->
+                ( model ! [], [ logDebug <| "PGListenSuccess:" +-+ ( pgConnectionId, channelName, listenUnlisten ) ] )
+
+            PGListenError dbConnectionInfo ( pgConnectionId, pgError ) ->
+                ( setUnconnected dbConnectionInfo pgConnectionId model ! [], [ nonFatal <| "PGListenError:" +-+ ( pgConnectionId, pgError ) ] )
+
+            PGListenEvent ( pgConnectionId, channelName, pgMessage ) ->
+                config.debug
+                    ? ( Debug.log "*** DEBUG DbWatcher PGListenEvent" pgMessage, "" )
+                    |> (always
+                            ((\event ->
+                                { entityName = getEntityName event
+                                , target = getTarget event
+                                , operation = getOperation event
+                                , propertyName = getPropertyName event
+                                }
+                                    |> (\parsedEvent ->
+                                            ( [ parsedEvent.entityName, parsedEvent.target, parsedEvent.operation ]
+                                                |> List.filter isErr
+                                                |> List.map (flip (??=) <| identity)
+                                            , { entityName = parsedEvent.entityName ??= always ""
+                                              , target = parsedEvent.target ??= always ""
+                                              , operation = parsedEvent.operation ??= always ""
+                                              , propertyName = parsedEvent.propertyName |??> Just ??= always Nothing
+                                              }
+                                            )
+                                       )
+                             )
+                                |> (\parse ->
+                                        (JD.decodeString (JD.at [ "event" ] eventDecoder) pgMessage)
+                                            |??>
+                                                (\event ->
+                                                    case event of
+                                                        Mutating mutatingEvent _ ->
+                                                            parse event
+                                                                |> (\( errors, parsedEvent ) ->
+                                                                        (errors == [])
+                                                                            ? ( model.running
+                                                                                    ? ( ( createRefreshList config model pgConnectionId parsedEvent.entityName parsedEvent.target parsedEvent.operation parsedEvent.propertyName model.watchedEntities
+                                                                                        , []
+                                                                                        )
+                                                                                      , ( [], [ "DbWatcher not running, listen event" +-+ parsedEvent.entityName +-+ "not processed" ] )
+                                                                                      )
+                                                                              , ( [], errors )
+                                                                              )
+                                                                   )
+
+                                                        NonMutating _ _ ->
+                                                            ( [], [] )
+                                                )
+                                            ??= (\err -> ( [], [ "Listen decoding error:" +-+ err ] ))
+                                   )
+                                |> (\( refreshList, errors ) ->
+                                        (errors == [])
+                                            ? ( ((List.length refreshList > 0) ? ( [ config.refreshTagger refreshList ], [] ))
+                                              , [ nonFatal <| String.join "\n" errors ]
+                                              )
+                                            |> (\msgs -> ( model ! [], msgs ))
+                                   )
+                            )
+                       )
+
+            RetryConnectCmd dbConnectionInfo retryCount failureMsg cmd ->
+                (case failureMsg of
+                    PGConnectError _ ( _, error ) ->
+                        nonFatal ("Database Connnection Error:" +-+ "Error:" +-+ error +-+ "Connection Retry:" +-+ retryCount +-+ "for connection:" +-+ { dbConnectionInfo | password = "" })
+
+                    _ ->
+                        Debug.crash "BUG -- Should never get here"
+                )
+                    |> (\msg -> ( model ! [ cmd ], [ msg ] ))
+
+            RetryMsg dbConnectionInfo msg ->
+                updateRetry dbConnectionInfo msg model
+
+
+{-|
+    subscriptions
+-}
+elmSubscriptions : Config msg -> Model -> Sub msg
+elmSubscriptions config model =
+    model.running
+        ? ( model.connectedDbConnections
+                |> Dict.values
+                |> List.map (\{ dbConnectionInfo, connectionId } -> Postgres.listen (PGListenError dbConnectionInfo) PGListenSuccess PGListenEvent connectionId channelName)
+                |> (List.map <| Sub.map config.routeToMeTagger)
+                |> Sub.batch
+          , Sub.none
+          )
+
+
+
+{-
+   Helpers
+-}
+
+
+createRefreshList : Config msg -> Model -> ConnectionId -> EntityName -> Target -> Operation -> Maybe PropertyName -> WatchedEntitiesDict -> List QueryId
+createRefreshList config model pgConnectionId compareEntityName compareTarget compareOperation compareMaybePropertyName watchedEntities =
     let
         compareEventType =
-            ( compareTarget, compareOperation, comparePropertyName )
+            Debug.log "compareEventType" ( compareTarget, compareOperation, compareMaybePropertyName )
 
         selectEventTypes eventTypes =
             List.length (List.filter (\eventType -> eventType == compareEventType) eventTypes) > 0
@@ -440,55 +448,51 @@ createRefreshList config compareEntityName compareTarget compareOperation compar
                 )
                 > 0
     in
-        Dict.filter (\_ entityEventTypesList -> selectWatchedEntities entityEventTypesList) watchedEntities
-            |> Dict.keys
+        (Dict.filter (\dbConnectionInfoStr { connectionId } -> pgConnectionId == connectionId) model.connectedDbConnections
+            |> Dict.toList
+            |> List.head
+        )
+            |?> (\( dbConnectionInfoStr, { dbConnectionInfo } ) ->
+                    config.debug
+                        ? ( DebugF.log "watchedEntities (createRefreshList)" watchedEntities, watchedEntities )
+                        |> Dict.filter (\_ { entityEventTypes, dbConnectionInfo } -> makeComparable dbConnectionInfo == dbConnectionInfoStr && selectWatchedEntities entityEventTypes)
+                        |> Dict.keys
+                )
+            ?= []
+            |> (\refreshList -> config.debug ? ( Debug.log "*** DEBUG DbWatcher Refresh List" refreshList, refreshList ))
 
 
-pgConnect : Config comparable msg -> DbConnectionInfo -> Model comparable -> ConnectCause -> ( Retry.Model Msg, Cmd Msg )
+msgToCmd : msg -> Cmd msg
+msgToCmd msg =
+    Task.perform (\_ -> msg) <| Task.succeed msg
+
+
+pgConnect : Config msg -> DbConnectionInfo -> Model -> ConnectCause -> ( Retry.Model Msg, Cmd Msg )
 pgConnect config dbConnectionInfo model cause =
-    Retry.retry retryConfig model.retryModel (PGConnectError cause) RetryConnectCmd (connectCmd dbConnectionInfo cause)
+    Retry.retry (retryConfig dbConnectionInfo) Retry.initModel (PGConnectError dbConnectionInfo) (RetryConnectCmd dbConnectionInfo) (connectCmd dbConnectionInfo cause)
 
 
-pgDisconnect : Maybe Int -> DisconnectCause -> Cmd Msg
-pgDisconnect pgListenConnectionId cause =
-    pgListenConnectionId
-        |?> (\pgConnectionId -> Postgres.disconnect (PGDisconnectError cause) (PGDisconnect cause) pgConnectionId False)
-        ?= Cmd.none
+pgDisconnect : Model -> ConnectionId -> DisconnectCause -> Cmd Msg
+pgDisconnect model pgConnectionId cause =
+    (Dict.filter (\_ { connectionId } -> pgConnectionId == connectionId) model.connectedDbConnections
+        |> Dict.toList
+        |> List.head
+    )
+        |?> (\( _, { dbConnectionInfo } ) -> dbConnectionInfo)
+        ?!= (\_ -> Debug.crash ("BUG: Cannot find connectionId"))
+        |> (\dbConnectionInfo ->
+                Postgres.disconnect (PGDisconnectError cause dbConnectionInfo) (PGDisconnect cause dbConnectionInfo) pgConnectionId False
+           )
 
 
 connectCmd : DbConnectionInfo -> ConnectCause -> FailureTagger ( ConnectionId, String ) Msg -> Cmd Msg
 connectCmd dbConnectionInfo cause failureTagger =
     Postgres.connect failureTagger
-        (PGConnect cause)
-        PGConnectionLost
+        (PGConnect cause dbConnectionInfo)
+        (PGConnectionLost dbConnectionInfo)
         dbConnectionInfo.timeout
         dbConnectionInfo.host
         dbConnectionInfo.port_
         dbConnectionInfo.database
         dbConnectionInfo.user
         dbConnectionInfo.password
-
-
-delayUpdateMsg : Time -> msg -> Cmd msg
-delayUpdateMsg delay msg =
-    Task.perform (\_ -> msg) <| Process.sleep delay
-
-
-delayCmd : Cmd Msg -> Time -> Cmd Msg
-delayCmd cmd =
-    (flip delayUpdateMsg) <| DoCmd cmd
-
-
-listenPayloadDecoder : JD.Decoder ListenPayload
-listenPayloadDecoder =
-    JD.succeed ListenPayload
-        <|| (field "event" eventDecoder)
-
-
-eventDecoder : JD.Decoder Event
-eventDecoder =
-    JD.succeed Event
-        <|| (field "entityName" JD.string)
-        <|| (field "target" JD.string)
-        <|| (field "operation" JD.string)
-        <|| maybe (field "propertyName" JD.string)
