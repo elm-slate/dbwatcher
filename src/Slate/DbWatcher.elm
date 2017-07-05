@@ -23,14 +23,14 @@ import Dict exposing (Dict)
 import Time exposing (Time)
 import Json.Decode as JD exposing (..)
 import Result.Extra as Result exposing (..)
-import Postgres exposing (..)
+import Postgres exposing (ConnectionId, ListenUnlisten)
 import StringUtils exposing (..)
 import Retry exposing (..)
 import Utils.Ops exposing (..)
 import Utils.Error exposing (..)
 import Utils.Log exposing (..)
 import ParentChildUpdate exposing (..)
-import Slate.Common.Db exposing (..)
+import Slate.Common.Db as Db exposing (..)
 import Slate.Common.Event exposing (..)
 import Slate.Common.Entity exposing (..)
 import Slate.Engine.Query exposing (..)
@@ -151,12 +151,12 @@ stop config model =
 
 setRetryModel : DbConnectionInfo -> Model -> Retry.Model Msg -> Model
 setRetryModel dbConnectionInfo model retryModel =
-    { model | retryModels = Dict.insert (makeComparable dbConnectionInfo) retryModel model.retryModels }
+    { model | retryModels = Dict.insert (Db.makeComparable dbConnectionInfo) retryModel model.retryModels }
 
 
 getRetryModel : DbConnectionInfo -> Model -> Retry.Model Msg
 getRetryModel dbConnectionInfo model =
-    makeComparable dbConnectionInfo
+    Db.makeComparable dbConnectionInfo
         |> (\dbConnectionInfoStr ->
                 Dict.get dbConnectionInfoStr model.retryModels
                     ?!= (\_ -> Debug.crash ("Cannot find retryModel for:" +-+ dbConnectionInfoStr +-+ "Retry models:" +-+ model.retryModels))
@@ -273,10 +273,10 @@ update config msg model =
                    )
 
         setConnected dbConnectionInfo pgConnectionId model =
-            { model | connectedDbConnections = Dict.insert (makeComparable dbConnectionInfo) { connectionId = pgConnectionId, dbConnectionInfo = dbConnectionInfo } model.connectedDbConnections }
+            { model | connectedDbConnections = Dict.insert (Db.makeComparable dbConnectionInfo) { connectionId = pgConnectionId, dbConnectionInfo = dbConnectionInfo } model.connectedDbConnections }
 
         setUnconnected dbConnectionInfo pgConnectionId model =
-            { model | connectedDbConnections = Dict.remove (makeComparable dbConnectionInfo) model.connectedDbConnections }
+            { model | connectedDbConnections = Dict.remove (Db.makeComparable dbConnectionInfo) model.connectedDbConnections }
 
         updateRetry dbConnectionInfo =
             updateChildParent (Retry.update (retryConfig dbConnectionInfo)) (update config) (getRetryModel dbConnectionInfo) (retryConfig dbConnectionInfo).routeToMeTagger (setRetryModel dbConnectionInfo)
@@ -292,26 +292,30 @@ update config msg model =
                 ( { model | watchedEntities = Dict.empty } ! [], [] )
 
             PGConnect cause dbConnectionInfo pgConnectionId ->
-                setConnected dbConnectionInfo pgConnectionId model
+                { model | retryModels = Dict.remove (Db.makeComparable dbConnectionInfo) model.retryModels }
                     |> (\model ->
-                            (case cause of
-                                StartingCause ->
-                                    ( Cmd.none, [] )
+                            setConnected dbConnectionInfo pgConnectionId model
+                                |> (\model ->
+                                        (case cause of
+                                            StartingCause ->
+                                                ( Cmd.none, [] )
 
-                                ReconnectCause ->
-                                    makeComparable dbConnectionInfo
-                                        |> (\dbConnectionInfoStr ->
-                                                model.watchedEntities
-                                                    |> Dict.filter (\_ { dbConnectionInfo } -> makeComparable dbConnectionInfo == dbConnectionInfoStr)
-                                                    |> Dict.keys
-                                                    |> (\refreshList -> model.running ? ( ( Cmd.none, [ config.refreshTagger refreshList ] ), ( pgDisconnect model pgConnectionId StopAfterConnectCause, [] ) ))
-                                           )
-                            )
-                                |> (\( cmd, msgs ) -> ( model ! [ cmd ], List.append msgs [ logDebug ("PGConnect:" +-+ pgConnectionId +-+ "Cause:" +-+ cause) ] ))
+                                            ReconnectCause ->
+                                                Db.makeComparable dbConnectionInfo
+                                                    |> (\dbConnectionInfoStr ->
+                                                            model.watchedEntities
+                                                                |> Dict.filter (\_ { dbConnectionInfo } -> Db.makeComparable dbConnectionInfo == dbConnectionInfoStr)
+                                                                |> Dict.keys
+                                                                |> (\refreshList -> model.running ? ( ( Cmd.none, [ config.refreshTagger refreshList ] ), ( pgDisconnect model pgConnectionId StopAfterConnectCause, [] ) ))
+                                                       )
+                                        )
+                                            |> (\( cmd, msgs ) -> ( model ! [ cmd ], List.append msgs [ logDebug ("PGConnect:" +-+ pgConnectionId +-+ "Cause:" +-+ cause) ] ))
+                                   )
                        )
 
             PGConnectError dbConnectionInfo ( _, pgError ) ->
-                ( model ! [], [ fatal ("Cannot connect to Database after" +-+ (retryConfig dbConnectionInfo).retryMax +-+ "attempt(s)." +-+ pgError) ] )
+                { model | retryModels = Dict.remove (Db.makeComparable dbConnectionInfo) model.retryModels }
+                    |> (\model -> ( model ! [], [ fatal ("Cannot connect to Database after" +-+ (retryConfig dbConnectionInfo).retryMax +-+ "attempt(s)." +-+ pgError) ] ))
 
             PGConnectionLost dbConnectionInfo ( pgConnectionId, pgError ) ->
                 setUnconnected dbConnectionInfo pgConnectionId model
@@ -455,7 +459,7 @@ createRefreshList config model pgConnectionId compareEntityName compareTarget co
             |?> (\( dbConnectionInfoStr, { dbConnectionInfo } ) ->
                     config.debug
                         ? ( DebugF.log "watchedEntities (createRefreshList)" watchedEntities, watchedEntities )
-                        |> Dict.filter (\_ { entityEventTypes, dbConnectionInfo } -> makeComparable dbConnectionInfo == dbConnectionInfoStr && selectWatchedEntities entityEventTypes)
+                        |> Dict.filter (\_ { entityEventTypes, dbConnectionInfo } -> Db.makeComparable dbConnectionInfo == dbConnectionInfoStr && selectWatchedEntities entityEventTypes)
                         |> Dict.keys
                 )
             ?= []
