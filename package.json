@@ -1,19 +1,13 @@
 {
-  "name": "slate-dbwatcher",
-  "version": "1.0.0",
+  "name": "@elm-slate/dbwatcher",
+  "version": "1.0.3",
   "description": "",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "author": "Don Gaudino",
   "license": "Unlicense",
-  "dependencies": {
-    "@panosoft/elm-native-helpers": "^0.1.6",
-    "pg": "^6.1.0",
-    "pg-query-stream": "^1.0.0",
-    "stream-read": "^1.1.2"
-  },
-  "devDependencies": {
-    "ws": "^3.0.0"
+"dependencies": {
+    "@panosoft/elm-postgres": "/Users/charles/Documents/workspace/elm/elm-slate/dbwatcher/elm-stuff/packages/panosoft/elm-postgres/4.2.0"
   }
 }
