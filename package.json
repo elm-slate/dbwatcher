@@ -8,6 +8,6 @@
   "author": "Don Gaudino",
   "license": "Unlicense",
 "dependencies": {
-    "@panosoft/elm-postgres": "/Users/charles/Documents/workspace/elm/elm-slate/dbwatcher/elm-stuff/packages/panosoft/elm-postgres/4.2.0"
+    "@panosoft/elm-postgres": "elm-stuff/grove/packages/panosoft/elm-postgres/installed"
   }
 }
